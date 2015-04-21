@@ -45,7 +45,7 @@ import           Data.Bits
 import qualified Data.Foldable as Fold
 import           Data.Map (Map)
 import qualified Data.Map as M
-import           Data.Maybe (catMaybes, isNothing)
+import           Data.Maybe (catMaybes, isNothing, fromMaybe)
 import           Data.Monoid (mappend, mempty)
 import           Data.Parameterized.Map (MapF)
 import qualified Data.Parameterized.Map as MF
@@ -75,11 +75,13 @@ data PointedSet tp = PointedSet { psTyp :: (TypeRepr tp)
 psValue :: Simple Lens (PointedSet tp) (Maybe (Set Integer))
 psValue = lens _psValue (\s v -> s { _psValue = v })
 
+prettySet :: (a -> Doc) -> Set a -> Doc
+prettySet f vs = encloseSep lbrace rbrace comma (map f (S.toList vs))
+
 instance PrettyF PointedSet where
   prettyF ps = case ps ^. psValue of
                 Nothing -> text "TOP"
-                Just vs -> encloseSep lbrace rbrace comma
-                           (map (\v' -> text (showHex v' "")) ( S.toList vs))
+                Just vs -> prettySet (\v' -> text (showHex v' "")) vs
 
 instance Eq (PointedSet a) where
   x == y =  x ^. psValue == y ^. psValue
@@ -145,7 +147,7 @@ deriving instance PrettyF ClampedSet
 clampSet :: PointedSet tp -> ClampedSet tp
 clampSet vs 
   | Just ps <- vs ^. psValue
-  , S.size ps > 256 = ClampedSet $ vs & psValue .~ Nothing
+  , S.size ps > 20  = ClampedSet $ vs & psValue .~ Nothing
   | otherwise       = ClampedSet vs
 
 instance Lattice ClampedSet where
@@ -164,14 +166,14 @@ instance AbsDomain ClampedSet where
 ------------------------------------------------------------------------
 -- Differentiating between stack and heap pointers
 
-newtype StackHeapSet tp = StackHeapSet { _shs :: PairF PointedSet PointedSet tp }
+newtype StackHeapSet tp = StackHeapSet { _shs :: PairF ClampedSet PointedSet tp }
 
 instance PrettyF StackHeapSet where
-  prettyF ps = text "HEAP: " <+> prettyF (ps ^. shs . _1)
-               <+> text " SP: " <+> prettyF (ps ^. shs . _2)
+  prettyF ps = text "HEAP:" <+> prettyF (ps ^. shs . _1)
+               <+> text "SP:" <+> prettyF (ps ^. shs . _2)
 
 shs :: Lens (StackHeapSet tp) (StackHeapSet tp')
-            (PairF PointedSet PointedSet tp) (PairF PointedSet PointedSet tp')
+            (PairF ClampedSet PointedSet tp) (PairF ClampedSet PointedSet tp')
 shs = lens _shs (\s v -> s { _shs = v })
 
 deriving instance POSet StackHeapSet
@@ -196,26 +198,34 @@ instance AbsDomain StackHeapSet where
 ------------------------------------------------------------------------
 -- Interpreter state
 
-newtype AbsBlockState f
-  = AbsBlockState { _absX86State :: X86State' f}
-  deriving Eq
+data AbsBlockState f
+  = AbsBlockState { _absX86State :: X86State' f
+                  , _absParents :: Set CodeAddr }
 
 absX86State :: Lens (AbsBlockState f) (AbsBlockState g) (X86State' f) (X86State' g)
 absX86State = lens _absX86State (\s v -> s { _absX86State = v })
 
+absParents :: Simple Lens (AbsBlockState f) (Set CodeAddr)
+absParents = lens _absParents (\s v -> s { _absParents = v })
+
 initAbsBlockState :: AbsDomain d => CodeAddr -> AbsBlockState d
 initAbsBlockState ip =
-  AbsBlockState $ mkX86State initialState
-                & register N.rip .~ singleton knownType (fromIntegral ip)
-
+  AbsBlockState
+   { _absX86State = mkX86State initialState
+                    & register N.rip .~ singleton knownType (fromIntegral ip)
+   , _absParents = S.empty }
+                      
 joinBlockState :: forall d. AbsDomain d =>
                   AbsBlockState d -> AbsBlockState d -> Maybe (AbsBlockState d)
 joinBlockState new old
-  | (merged, True) <- runState go False = Just (AbsBlockState merged)
+  | (merged, True) <- runState go False = Just (AbsBlockState merged parents)
+  | not ((new ^. absParents) `S.isSubsetOf` (old ^. absParents))
+    = Just (old & absParents .~ parents)
   | otherwise = Nothing
   where
-    go = zipWithX86StateM join1 (new ^. absX86State) (old ^. absX86State)
+    parents = (new ^. absParents) `S.union` (old ^. absParents)
     
+    go = zipWithX86StateM join1 (new ^. absX86State) (old ^. absX86State)
     join1 :: forall tp. d tp -> d tp -> State Bool (d tp)
     join1 v v' = case joinD v v' of
                   Nothing -> return v'
@@ -225,8 +235,6 @@ type AbsState d = Map CodeAddr (AbsBlockState d)
 
 emptyAbsState :: AbsState d
 emptyAbsState = M.empty
-
-
 
 data InterpState d = InterpState
                      { _cfg      :: !CFG
@@ -389,13 +397,19 @@ transferStmt ab stmt = go stmt
        SetUndefined _ -> top (assignRhsType rhs)
        Read _         -> top (assignRhsType rhs)
 
-abstractState :: AbsDomain d => AbsBlockState d -> AssignState d
+abstractState :: AbsDomain d =>
+                 AbsBlockState d -> AssignState d
                  -> X86State -> [(ExploreLoc, AbsBlockState d)]
 abstractState ab m s =
   case concretize (abst ^. curIP) of
    Nothing  -> trace "Hit top" [] -- we hit top, so give up
-   Just ips -> 
-     [ (loc, AbsBlockState $ abst & curIP .~ x_w)
+   Just ips ->
+     let parent = fromMaybe (error "Expecting 1 parent")
+                            (concretize (ab ^. (absX86State . register N.rip)))
+     in
+     [ (loc, AbsBlockState { _absX86State = abst & curIP .~ x_w
+                           , _absParents = S.map fromInteger parent
+                           })
      | x <- S.toList ips
      , let x_w = singleton knownType x
      , let t = case s ^. x87TopReg of
@@ -539,13 +553,16 @@ class PrettyF (f :: k -> *) where
   prettyListF = list . map prettyF
   
 instance (AbsDomain d, PrettyF d) => Pretty (AbsBlockState d) where
-  pretty (AbsBlockState s) =
-    bracketsep $ catMaybes ([ rec   N.rip (s^.curIP)]
-                            ++ recv N.GPReg (s^.reg64Regs)
-                            ++ recv N.FlagReg (s^.flagRegs)
-                            ++ recv N.X87ControlReg (s^.x87ControlWord)
-                            ++ recv N.X87StatusReg (s^.x87StatusWord)
-                            ++ recv N.X87TagReg (s^.x87TagWords)
-                            ++ recv N.X87FPUReg (s^.x87Regs)
-                            ++ recv N.XMMReg (s^.xmmRegs))
-
+  pretty st =
+    vcat [ text "parent =" <+> prettySet (\v -> text $ showHex v "")
+                                         (st ^. absParents)
+         , bracketsep $ catMaybes ([ rec   N.rip (s^.curIP)]
+                                   ++ recv N.GPReg (s^.reg64Regs)
+                                   ++ recv N.FlagReg (s^.flagRegs)
+                                   ++ recv N.X87ControlReg (s^.x87ControlWord)
+                                   ++ recv N.X87StatusReg (s^.x87StatusWord)
+                                   ++ recv N.X87TagReg (s^.x87TagWords)
+                                   ++ recv N.X87FPUReg (s^.x87Regs)
+                                   ++ recv N.XMMReg (s^.xmmRegs) )
+         ]
+    where s = st ^. absX86State
