@@ -2,6 +2,8 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module Main (main) where
 
 import           Control.Lens
@@ -33,6 +35,7 @@ import           Data.Type.Equality as Equality
 import           Flexdis86 (InstructionInstance(..))
 import           Reopt
 import           Reopt.Memory
+import           Reopt.Semantics.AbsDomain
 import           Reopt.Semantics.CFGDiscovery
 import           Reopt.Semantics.DeadRegisterElimination
 import           Reopt.Semantics.Monad (Type(..))
@@ -46,6 +49,7 @@ import qualified Reopt.Semantics.StateNames as N
 data Action
    = DumpDisassembly -- ^ Print out disassembler output only.
    | ShowCFG         -- ^ Print out control-flow microcode.
+   | ShowCFGAI       -- ^ Print out control-flow microcode + abs domain
    | ShowGaps        -- ^ Print out gaps in discovered blocks
    | ShowHelp        -- ^ Print out help message
    | ShowVersion     -- ^ Print out version
@@ -82,6 +86,11 @@ cfgFlag = flagNone [ "cfg", "c" ] upd help
   where upd  = reoptAction .~ ShowCFG
         help = "Print out recovered control flow graph of executable."
 
+cfgAIFlag :: Flag Args
+cfgAIFlag = flagNone [ "ai", "a" ] upd help
+  where upd  = reoptAction .~ ShowCFGAI
+        help = "Print out recovered control flow graph + AI of executable."
+
 gapFlag :: Flag Args
 gapFlag = flagNone [ "gap", "g" ] upd help
   where upd  = reoptAction .~ ShowGaps
@@ -92,6 +101,7 @@ arguments = mode "reopt" defaultArgs help filenameArg flags
   where help = reoptVersion ++ "\n" ++ copyrightNotice
         flags = [ disassembleFlag
                 , cfgFlag
+                , cfgAIFlag
                 , gapFlag
                 , flagHelpSimple (reoptAction .~ ShowHelp)
                 , flagVersion (reoptAction .~ ShowVersion)
@@ -172,6 +182,21 @@ getCFG path =  do
   -- Get list of code locations to explore starting from entry points (i.e., eltEntry)
   return $ (mem, cfgFromAddress mem (elfEntry e))
 
+getCFGAI :: (PrettyF d, AbsDomain d) => FilePath
+            -> IO (Memory Word64, (CFG, Set CodeAddr, AbsState d))
+getCFGAI path =  do
+  e <- readElf64 path
+  mi <- elfInterpreter e
+  case mi of
+    Nothing ->
+      return ()
+    Just{} ->
+      fail "reopt does not yet support generating CFGs from dynamically linked executables."
+  -- Build model of executable memory from elf.
+  mem <- loadElf e
+  -- Get list of code locations to explore starting from entry points (i.e., eltEntry)
+  return $ (mem, absInt mem (elfEntry e))
+
 isInterestingCode :: Memory Word64 -> (CodeAddr, Maybe CodeAddr) -> Bool
 isInterestingCode mem (start, Just end) = go start end
   where
@@ -214,7 +239,7 @@ showCFG :: FilePath -> IO ()
 showCFG path = do
   (_, (g0, _)) <- getCFG path
   let g = eliminateDeadRegisters g0
-  print (pretty g)
+  print (pretty g)  
 {-
   putStrLn $ "Found potential calls: " ++ show (Map.size (cfgCalls g))
 
@@ -231,6 +256,20 @@ showCFG path = do
       print $ "Found start " ++ showHex a ""
       print (pretty b)
 -}
+
+showCFGAndAI :: FilePath -> IO ()
+showCFGAndAI path = do
+  (_, (g0, _, abst :: AbsState StackHeapSet)) <- getCFGAI path
+  let g  = eliminateDeadRegisters g0
+      ppOne b = vcat [case (blockLabel b, Map.lookup (blockParent (blockLabel b)) abst) of
+                       (DecompiledBlock _, Just ab) -> pretty ab
+                       _                            -> empty
+                     , pretty b]
+                
+        where
+          k = blockLabel b
+                  
+  print $ vcat (map ppOne $ Map.elems (g^.cfgBlocks))
 
 hasCall :: Block -> Bool
 hasCall b = any isCallComment (blockStmts b)
@@ -440,6 +479,8 @@ main = do
       dumpDisassembly (args^.programPath)
     ShowCFG -> do
       showCFG (args^.programPath)
+    ShowCFGAI -> do
+      showCFGAndAI (args^.programPath)      
     ShowGaps -> showGaps (args^.programPath)
     ShowHelp ->
       print $ helpText [] HelpFormatDefault arguments

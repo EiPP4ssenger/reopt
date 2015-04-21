@@ -9,29 +9,46 @@
 -- This contains an implementation of a CFG discovery algorithm based
 -- upon an interleaved abstract interpretation (currently unsound)
 ------------------------------------------------------------------------
-{-# LANGUAGE PatternGuards #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE ViewPatterns #-}
 
 module Reopt.Semantics.CFGDiscovery
        ( cfgFromAddress
-       ) where
+         -- Abstract Interpreter
+       , absInt
+       , AbsState
+       , AbsBlockState(..)
+       , absX86State
+         -- Domains
+       , PointedSet(..)
+       , StackHeapSet
+         -- Helpers
+       , PrettyF(..)
+       )
+       where
 
-import           Control.Applicative ( (<$>) )
+import           Control.Applicative ( (<$>), (<*>) )
 import           Control.Lens
-import           Control.Monad.Reader
 import           Control.Monad.State.Strict
+import           Data.Bits
 import qualified Data.Foldable as Fold
 import           Data.Map (Map)
 import qualified Data.Map as M
-import           Data.Maybe (fromJust, fromMaybe, catMaybes)
+import           Data.Maybe (catMaybes, isNothing)
 import           Data.Monoid (mappend, mempty)
+import           Data.Parameterized.Map (MapF)
+import qualified Data.Parameterized.Map as MF
 import           Data.Parameterized.NatRepr
 import           Data.Set (Set)
 import qualified Data.Set as S
@@ -39,10 +56,10 @@ import qualified Data.Vector as V
 import           Data.Word
 import           Debug.Trace
 import           Numeric (showHex)
-import           Text.PrettyPrint.ANSI.Leijen (pretty)
 import           Text.PrettyPrint.ANSI.Leijen as PP hiding ((<$>))
 
 import           Reopt.Memory
+import           Reopt.Semantics.AbsDomain
 import           Reopt.Semantics.Implementation
 import           Reopt.Semantics.Representation
 import qualified Reopt.Semantics.StateNames as N
@@ -50,90 +67,176 @@ import           Reopt.Semantics.Types
 import qualified Reopt.Semantics.WorkList as WL
 
 ------------------------------------------------------------------------
--- Abstract states
+-- Pointed set domains
 
-class Eq d => AbsDomain d where
-  -- | The top element
-  top :: d
+data PointedSet tp = PointedSet { psTyp :: (TypeRepr tp)
+                                , _psValue :: Maybe (Set Integer) }
 
-  -- | A partial ordering over d.  forall x. x `leq` top
-  leq :: d -> d -> Bool
+psValue :: Simple Lens (PointedSet tp) (Maybe (Set Integer))
+psValue = lens _psValue (\s v -> s { _psValue = v })
 
-  -- | Least upper bound (always defined, as we have top)
-  lub :: d -> d -> d
-  
-  -- | Join the old and new states and return the updated state iff
-  -- the result is larger than the old state.
-  joinD :: d -> d -> Maybe d
-  joinD old new
-    | new `leq` old = Nothing
-    | otherwise     = Just $ lub old new
+instance PrettyF PointedSet where
+  prettyF ps = case ps ^. psValue of
+                Nothing -> text "TOP"
+                Just vs -> encloseSep lbrace rbrace comma
+                           (map (\v' -> text (showHex v' "")) ( S.toList vs))
+
+instance Eq (PointedSet a) where
+  x == y =  x ^. psValue == y ^. psValue
+
+instance EqF PointedSet where
+  eqF = (==)
+
+instance POSet PointedSet where
+  leq x y = case (x ^. psValue, y ^. psValue) of
+             (_, Nothing)      -> True
+             (Nothing, _)      -> False
+             (Just v, Just v') -> v `S.isSubsetOf` v'
+
+instance Lattice PointedSet where
+  top tp      = PointedSet { psTyp = tp, _psValue = Nothing }
+  bottom tp   = PointedSet { psTyp = tp, _psValue = Just S.empty }
+
+  lub x y = PointedSet { psTyp = psTyp x, _psValue = val }
+    where
+      val = case (x ^. psValue, y ^. psValue) of
+             (_, Nothing)      -> Nothing
+             (Nothing, _)      -> Nothing
+             (Just v, Just v') -> Just $ v `S.union` v' 
+
+  glb x y = case (x ^. psValue, y ^. psValue) of
+             (_, Nothing)      -> y
+             (Nothing, _)      -> x
+             (Just v, Just v') ->
+               PointedSet { psTyp = psTyp x, _psValue = Just $ v `S.intersection` v' }
+
+  isTop ps = isNothing ( ps ^. psValue )
+
+clampForType :: TypeRepr tp -> Integer -> Integer
+clampForType tp = case tp of BVTypeRepr n -> \v -> v .&. maxUnsigned n
+                               
+instance AbsDomain PointedSet where
+  transfer app =
+    case app of
+     BVAdd n x y -> binop (+) n x y
+     _           -> top (appType app)
+    where
+      binop f n v v' =
+        case (v ^. psValue, v' ^. psValue) of
+         (Just vs, Just vs') ->
+           abstract (psTyp v) [ f x y .&. maxUnsigned n
+                                  | x <- S.toList vs
+                                  , y <- S.toList vs' ]
+         _                   -> top (psTyp v)
     
+  concretize d = d ^. psValue
+  abstract tp vs =
+    let insertOne s v = S.insert (clampForType tp v) s
+    in PointedSet { psTyp = tp
+                  , _psValue = Just $ Fold.foldl' insertOne S.empty vs }
+
+  -- singleton tp v = PointedSet { psTyp = tp, _psValue = Just (S.singleton v) }
+
+newtype ClampedSet tp = ClampedSet { unClampSet :: PointedSet tp }
+
+deriving instance POSet ClampedSet
+deriving instance PrettyF ClampedSet
+
+clampSet :: PointedSet tp -> ClampedSet tp
+clampSet vs 
+  | Just ps <- vs ^. psValue
+  , S.size ps > 256 = ClampedSet $ vs & psValue .~ Nothing
+  | otherwise       = ClampedSet vs
+
+instance Lattice ClampedSet where
+  top = ClampedSet . top
+  bottom = ClampedSet . bottom
+  isTop  = isTop . unClampSet
+  
+  lub x y = clampSet $ lub (unClampSet x) (unClampSet y)
+  glb x y = clampSet $ glb (unClampSet x) (unClampSet y)
+
+instance AbsDomain ClampedSet where
+  transfer app = clampSet $ transfer (mapApp unClampSet app)
+  concretize d = unClampSet d ^. psValue
+  abstract tp vs = clampSet $ abstract tp vs
+
+------------------------------------------------------------------------
+-- Differentiating between stack and heap pointers
+
+newtype StackHeapSet tp = StackHeapSet { _shs :: PairF PointedSet PointedSet tp }
+
+instance PrettyF StackHeapSet where
+  prettyF ps = text "HEAP: " <+> prettyF (ps ^. shs . _1)
+               <+> text " SP: " <+> prettyF (ps ^. shs . _2)
+
+shs :: Lens (StackHeapSet tp) (StackHeapSet tp')
+            (PairF PointedSet PointedSet tp) (PairF PointedSet PointedSet tp')
+shs = lens _shs (\s v -> s { _shs = v })
+
+deriving instance POSet StackHeapSet
+deriving instance Lattice StackHeapSet
+
+instance AbsDomain StackHeapSet where
+  transfer app   = StackHeapSet $ transfer (mapApp (view shs) app)
+  concretize d   = concretize (d ^. (shs . _1)) -- FIXME: correct?
+  abstract tp vs = StackHeapSet $ PairF (abstract tp vs) (bottom tp)
+  finishBlock f  = shs . _2 . psValue %~ normalizeSP
+    where
+      normalizeSP m_v = (\x -> S.map (\v -> v - x)) <$> sp' <*> m_v
+      sp' = case concretize (f N.rsp ^. shs . _2) of
+             Just vs | [v] <- S.toList vs -> Just v
+             _ -> trace "Post-sp isn't a singleton" Nothing
+  initialState r 
+    | Just Refl <- testEquality r N.rsp
+      = let v = StackHeapSet $ PairF (top knownType) (singleton knownType 0)
+        in trace ("initialState " ++ show (prettyF v)) v
+    | otherwise  = top (N.registerType r)
+
 ------------------------------------------------------------------------
 -- Interpreter state
 
--- FIXME: types/sizes?
-data AbsValue = TopV
-              | AbsValue { _absValues :: Set Integer }
-                deriving Eq
+newtype AbsBlockState f
+  = AbsBlockState { _absX86State :: X86State' f}
+  deriving Eq
 
-abstractSingleton :: Integer -> AbsValue
-abstractSingleton = AbsValue . S.singleton
-
-concretize :: AbsValue -> Maybe (Set Integer)
-concretize TopV         = Nothing
-concretize (AbsValue s) = Just s
-
-newtype AbsValue' (a :: Type) = AbsValue' { unAbsValue' :: AbsValue }
-                                deriving (AbsDomain)
-
-instance Eq (AbsValue' a) where
-  AbsValue' x == AbsValue' y = x == y
-
-instance EqF AbsValue' where
-  eqF = (==)
-
-emptyAbsValue :: AbsValue
-emptyAbsValue = AbsValue S.empty
-
-newtype AbsBlockState = AbsBlockState { _absX86State :: X86State' AbsValue' }
-                        deriving Eq
-
-absX86State :: Simple Lens AbsBlockState (X86State' AbsValue')
+absX86State :: Lens (AbsBlockState f) (AbsBlockState g) (X86State' f) (X86State' g)
 absX86State = lens _absX86State (\s v -> s { _absX86State = v })
 
-instance AbsDomain AbsValue where
-  top = TopV
+initAbsBlockState :: AbsDomain d => CodeAddr -> AbsBlockState d
+initAbsBlockState ip =
+  AbsBlockState $ mkX86State initialState
+                & register N.rip .~ singleton knownType (fromIntegral ip)
 
-  leq _ TopV = True
-  leq TopV _ = False
-  leq (AbsValue v) (AbsValue v') = v `S.isSubsetOf` v'
+joinBlockState :: forall d. AbsDomain d =>
+                  AbsBlockState d -> AbsBlockState d -> Maybe (AbsBlockState d)
+joinBlockState new old
+  | (merged, True) <- runState go False = Just (AbsBlockState merged)
+  | otherwise = Nothing
+  where
+    go = zipWithX86StateM join1 (new ^. absX86State) (old ^. absX86State)
+    
+    join1 :: forall tp. d tp -> d tp -> State Bool (d tp)
+    join1 v v' = case joinD v v' of
+                  Nothing -> return v'
+                  Just nv -> put True >> return nv
 
-  lub _ TopV = TopV
-  lub TopV _ = TopV
-  lub (AbsValue v) (AbsValue v') = AbsValue $ v `S.union` v'
-  
-instance AbsDomain AbsBlockState where
-  top = AbsBlockState $ mkX86State (\_ -> top)
-  leq (AbsBlockState x) (AbsBlockState y)
-    = cmpX86State leq x y
-  lub (AbsBlockState x) (AbsBlockState y)
-    = AbsBlockState $ zipWithX86State lub x y
-  
-type AbsState = Map CodeAddr AbsBlockState
+type AbsState d = Map CodeAddr (AbsBlockState d)
 
-emptyAbsState :: AbsState
+emptyAbsState :: AbsState d
 emptyAbsState = M.empty
 
-data InterpState = InterpState
-                   { _cfg      :: !CFG
-                   , _failedAddrs  :: !(Set CodeAddr)
-                   , _guessedAddrs :: !(Set CodeAddr)
-                   , _blockEnds   :: !(Set CodeAddr)                     
-                   , _genState :: !GlobalGenState
-                   , _memory   :: !(Memory Word64) -- read only
-                   , _absState :: !AbsState
-                   }
+
+
+data InterpState d = InterpState
+                     { _cfg      :: !CFG
+                     , _failedAddrs  :: !(Set CodeAddr)
+                     , _guessedAddrs :: !(Set CodeAddr)
+                     , _blockEnds   :: !(Set CodeAddr)                     
+                     , _genState :: !GlobalGenState
+                     , _memory   :: !(Memory Word64) -- read only
+                     , _absState :: !(AbsState d)
+                     }
 
 emptyInterpState mem = InterpState
       { _cfg = emptyCFG
@@ -145,25 +248,25 @@ emptyInterpState mem = InterpState
       , _absState    = emptyAbsState
       }
 
-cfg :: Simple Lens InterpState CFG
+cfg :: Simple Lens (InterpState d) CFG
 cfg = lens _cfg (\s v -> s { _cfg = v })
 
-genState :: Simple Lens InterpState GlobalGenState
+genState :: Simple Lens (InterpState d) GlobalGenState
 genState = lens _genState (\s v -> s { _genState = v })
 
-failedAddrs :: Simple Lens InterpState (Set CodeAddr)
+failedAddrs :: Simple Lens (InterpState d) (Set CodeAddr)
 failedAddrs = lens _failedAddrs (\s v -> s { _failedAddrs = v })
 
-guessedAddrs :: Simple Lens InterpState (Set CodeAddr)
+guessedAddrs :: Simple Lens (InterpState d) (Set CodeAddr)
 guessedAddrs = lens _guessedAddrs (\s v -> s { _guessedAddrs = v })
 
-blockEnds :: Simple Lens InterpState (Set CodeAddr)
+blockEnds :: Simple Lens (InterpState d) (Set CodeAddr)
 blockEnds = lens _blockEnds (\s v -> s { _blockEnds = v })
 
-memory :: Simple Lens InterpState (Memory Word64)
+memory :: Simple Lens (InterpState d) (Memory Word64)
 memory = lens _memory (\s v -> s { _memory = v })
 
-absState :: Simple Lens InterpState AbsState
+absState :: Lens (InterpState d) (InterpState d') (AbsState d) (AbsState d')
 absState = lens _absState (\s v -> s { _absState = v })
 
 liftEither :: StateT s (Either e) a -> State s (Either e a)
@@ -184,10 +287,11 @@ subMonad l m = l %%= runState m
 -- Block discovery
 
 -- | Does a simple lookup in the cfg at a given DecompiledBlock address.
-lookupBlock :: MonadState InterpState m => CodeAddr -> m (Maybe Block)
+lookupBlock :: MonadState (InterpState d) m => CodeAddr -> m (Maybe Block)
 lookupBlock addr = uses (cfg . cfgBlocks) (M.lookup (DecompiledBlock addr))
 
-lookupAbsState :: MonadState InterpState m => CodeAddr -> m (Maybe AbsBlockState)
+lookupAbsState :: MonadState (InterpState d) m => 
+                  CodeAddr -> m (Maybe (AbsBlockState d))
 lookupAbsState addr = uses absState (M.lookup addr)
 
 newtype Hex = Hex Integer
@@ -201,7 +305,7 @@ instance Show Hex where
 
 -- | This is the worker for getBlock, in the case that the cfg doesn't
 -- contain the address of interest.
-reallyGetBlock :: MonadState InterpState m => ExploreLoc -> m (Maybe Block)
+reallyGetBlock :: MonadState (InterpState d) m => ExploreLoc -> m (Maybe Block)
 reallyGetBlock loc = do
   mem <- use memory
   r <- subMonad genState (liftEither $ disassembleBlock mem loc)
@@ -218,7 +322,7 @@ reallyGetBlock loc = do
 -- will disassemble the binary if the block hasn't been seen before.
 -- In particular, this ensures that a block and all it's children are
 -- present in the cfg (assuming successful disassembly)
-getBlock :: MonadState InterpState m => ExploreLoc -> m (Maybe Block)
+getBlock :: MonadState (InterpState d) m => ExploreLoc -> m (Maybe Block)
 getBlock loc = do let addr = (loc_ip loc)
                   m_b <- lookupBlock addr
                   failed <- uses failedAddrs (S.member addr)
@@ -229,7 +333,7 @@ getBlock loc = do let addr = (loc_ip loc)
 ------------------------------------------------------------------------
 -- Transfer functions
 
-type Path = [(Value BoolType, Bool)]
+-- type Path = [(Value BoolType, Bool)]
 
 -- blockPaths :: CFG -> Block -> [(X86State, Path)]
 -- blockPaths c root = traverseBlockAndChildren c root go merge
@@ -240,28 +344,35 @@ type Path = [(Value BoolType, Bool)]
 --             FetchAndExecute s -> [(s, [])]
 --             _                 -> [] 
 
-transferValue :: AbsBlockState -> Map AssignId AbsValue -> Value tp -> AbsValue
+type AssignState d = MapF Assignment d
+
+transferValue :: AbsDomain d => AbsBlockState d -> AssignState d -> Value tp -> d tp
 transferValue ab m v =
   case v of
-   BVValue _ i -> abstractSingleton i
+   BVValue n i -> singleton (BVTypeRepr n) i
    -- Invariant: v is in m
-   AssignedValue (Assignment r _) ->
-     fromMaybe (error $ "Missing assignment for " ++ show r) (M.lookup r m)
-   Initial r -> unAbsValue' $ ab ^. (absX86State . register r)
+   AssignedValue k@Assignment{} ->
+     case MF.lookup k m of
+      Just v -> v
+      Nothing -> error $ "Missing abstract state for "
+                          ++ show (ppAssignId $ assignId k)
+   Initial r -> ab ^. (absX86State . register r)
    
-transferApp :: AbsBlockState -> Map AssignId AbsValue -> App Value tp -> AbsValue
-transferApp ab app m = top
+transferApp :: AbsDomain d => AbsBlockState d -> AssignState d
+               -> App Value tp -> d tp
+transferApp ab m app = transfer $ mapApp (transferValue ab m) app
 
+-- FIXME: move
 type_width' :: TypeRepr tp -> Int
 type_width' (BVTypeRepr n) = widthVal n
 
-transferStmt :: AbsBlockState -> Stmt
-                -> State (Map AssignId AbsValue) (Set CodeAddr)
+transferStmt :: forall d. AbsDomain d => AbsBlockState d -> Stmt
+                -> State (AssignState d) (Set CodeAddr)
 transferStmt ab stmt = go stmt
   where
-    go :: Stmt -> State (Map AssignId AbsValue) (Set CodeAddr)
-    go (AssignStmt (Assignment v rhs)) =
-      do modify (\m -> M.insert v (evalRHS m rhs) m)
+    go :: Stmt -> State (AssignState d) (Set CodeAddr)
+    go (AssignStmt assign@(Assignment _ rhs)) =
+      do modify (\m -> MF.insert assign (evalRHS m rhs) m)
          return S.empty
     go (Write (MemLoc _ tp) v)
       | type_width' tp == 64 = do
@@ -269,24 +380,24 @@ transferStmt ab stmt = go stmt
           return $ case concretize vs of
                     Nothing  -> S.empty
                     Just vs' -> S.map fromInteger vs'
-    go _                               = return S.empty
+    go _                     = return S.empty
 
-    evalRHS :: forall tp.  Map AssignId AbsValue -> AssignRhs tp -> AbsValue
+    evalRHS :: forall tp.  AssignState d -> AssignRhs tp -> d tp
     evalRHS m rhs =
       case rhs of
        EvalApp app    -> transferApp ab m app
-       SetUndefined _ -> TopV
-       Read _         -> TopV
+       SetUndefined _ -> top (assignRhsType rhs)
+       Read _         -> top (assignRhsType rhs)
 
-abstractState :: AbsBlockState -> Map AssignId AbsValue -> X86State
-                 -> [(ExploreLoc, AbsBlockState)]
+abstractState :: AbsDomain d => AbsBlockState d -> AssignState d
+                 -> X86State -> [(ExploreLoc, AbsBlockState d)]
 abstractState ab m s =
-  case concretize (unAbsValue' (abst ^. curIP)) of
+  case concretize (abst ^. curIP) of
    Nothing  -> trace "Hit top" [] -- we hit top, so give up
    Just ips -> 
      [ (loc, AbsBlockState $ abst & curIP .~ x_w)
      | x <- S.toList ips
-     , let x_w = AbsValue' (abstractSingleton x)
+     , let x_w = singleton knownType x
      , let t = case s ^. x87TopReg of
                 BVValue _ v -> v
                 _ -> error "x87top is not concrete"
@@ -295,12 +406,13 @@ abstractState ab m s =
                             }
      ]
   where
-    abst = mkX86State (\r -> AbsValue' $ transferValue ab m (s ^. register r))
+    abst = let s0 = mkX86State (\r -> transferValue ab m (s ^. register r))
+           in mapX86State (finishBlock (\r -> s0 ^. register r)) s0
 
-transferBlock :: CFG -> Block -> AbsBlockState
-                 -> (Set CodeAddr, [(ExploreLoc, AbsBlockState)])
+transferBlock :: (PrettyF d, AbsDomain d) => CFG -> Block -> AbsBlockState d
+                 -> (Set CodeAddr, [(ExploreLoc, AbsBlockState d)])
 transferBlock c root ab =
-  traverseBlockAndChildren c root leaf merge M.empty
+  traverseBlockAndChildren c root leaf merge MF.empty
   & _1 %~ S.unions
   where
     merge b l r m = let (guesses, m_b) = go b m
@@ -311,67 +423,89 @@ transferBlock c root ab =
                  _                 -> mempty -- can't happen
 
     go b = runState (mapM (transferStmt ab) (blockStmts b))
-
       
 -- | Joins in the new abstract state and returns the locations for
 -- which the new state is changed.
-mergeBlocks :: [(ExploreLoc, AbsBlockState)] -> State AbsState [ExploreLoc]
+mergeBlocks :: forall d. (PrettyF d, AbsDomain d)
+               => [(ExploreLoc, AbsBlockState d)]
+               -> State (AbsState d) [ExploreLoc]
 mergeBlocks bs = state (\s -> Fold.foldl' mergeBlock ([], s) bs)
   where
+    mergeBlock :: ([ExploreLoc], AbsState d)
+                  -> (ExploreLoc, AbsBlockState d)
+                  -> ([ExploreLoc], AbsState d)
     mergeBlock r@(locs, s) (loc, ab) =
-      let upd new = ( loc : locs, M.insert (loc_ip loc) new s )
+      let upd :: AbsBlockState d -> ([ExploreLoc], AbsState d)
+          upd new = ( loc : locs, M.insert (loc_ip loc) new s )
       in
       case M.lookup (loc_ip loc) s of
        -- We have seen this block before, so need to join and see if
        -- the results is changed.
-       Just ab' -> case joinD ab' ab of
+       Just ab' -> case joinBlockState ab ab' of
                     Nothing  -> r
-                    Just new -> trace ("Merging state for " ++ show (pretty loc)
-                                      ++ "\n" ++ show (pretty new))
-                                $ upd new
+                    Just new ->
+                      trace ("Merging\n"
+                             ++ show (pretty ab) 
+                             ++ "\n" ++ show (pretty ab')
+                             ++ "\n" ++ show (pretty new)
+                            ) $ upd new
 
        -- We haven't seen this block before
-       Nothing  -> trace ("Adding state for " ++ show (pretty loc)
-                          ++ "\n" ++ show (pretty ab)) $ upd ab
+       Nothing  -> upd ab
 
-transfer :: MonadState InterpState m => ExploreLoc -> m [ExploreLoc]
-transfer loc = do m_b  <- getBlock loc
-                  m_ab <- lookupAbsState (loc_ip loc)
-                  case (m_b, m_ab) of
-                   (Just b, Just s) ->
-                     do c <- use cfg
-                        let (guesses, vs) = transferBlock c b s
-                        guessedAddrs %= S.union guesses
-                        subMonad absState (mergeBlocks vs)
-                   _                -> return []
+transferLoc :: (PrettyF d, AbsDomain d, MonadState (InterpState d) m)
+               => ExploreLoc -> m [ExploreLoc]
+transferLoc loc = 
+  do m_b  <- getBlock loc
+     m_ab <- lookupAbsState (loc_ip loc)
+     case (m_b, m_ab) of
+      (Just b, Just s) ->
+        do c <- use cfg
+           let (guesses, vs) = transferBlock c b s
+           guessedAddrs %= S.union guesses
+           subMonad absState (mergeBlocks vs)
+      _                -> return []
 
 ------------------------------------------------------------------------
 -- Main loop
+
+absInt :: (PrettyF d, AbsDomain d) =>
+          Memory Word64
+          -- ^ Memory to use when decoding instructions.
+          -> CodeAddr
+          -- ^ Location to start disassembler form.
+          -> (CFG, Set CodeAddr, AbsState d)
+absInt mem start = (s' ^. cfg, s' ^. blockEnds, s' ^. absState)
+  where
+    s' = go (emptyInterpState mem) (S.singleton start)
+    -- go :: InterpState PointedSet -> Set CodeAddr -> InterpState PointedSet
+    go st roots
+      | S.null roots = st
+      | otherwise    =
+          let wl   = WL.fromSet (S.map rootLoc roots)
+              st'  = st & absState %~ addTops roots
+              st'' = execState (WL.iterate transferLoc wl) st'
+              cfgAddrs = S.map blockParent (M.keysSet (st'' ^. (cfg . cfgBlocks)))
+              roots' = (st'' ^. guessedAddrs)
+                       `S.difference`
+                       ( cfgAddrs `S.union` (st'' ^. failedAddrs ) )
+          in go (st'' & guessedAddrs .~ S.empty) (S.filter isCodePointer roots')
+    
+    addTops roots m = 
+      Fold.foldl' (\m' k -> M.insert k (initAbsBlockState k) m') m roots
+             
+    isCodePointer :: CodeAddr -> Bool
+    isCodePointer val = addrHasPermissions (fromIntegral val) pf_x mem
 
 cfgFromAddress :: Memory Word64
                   -- ^ Memory to use when decoding instructions.
                -> CodeAddr
                   -- ^ Location to start disassembler form.
                -> (CFG, Set CodeAddr)
-cfgFromAddress mem start = (s' ^. cfg, s' ^. blockEnds)
+cfgFromAddress mem start = (c, ends)
   where
-    s' = go (emptyInterpState mem) (S.singleton start)
-    go st roots
-      | S.null roots = st
-      | otherwise    =
-          let wl   = WL.fromSet (S.map rootLoc roots)
-              st'  = st & absState %~ addTops roots
-              st'' = execState (WL.iterate transfer wl) st'
-          in go (st'' & guessedAddrs .~ S.empty) (st'' ^. guessedAddrs)
+    (c, ends, _abs :: AbsState PointedSet) = absInt mem start
     
-    addTops roots m =
-      Fold.foldl' (\m' k -> M.insertWith (\_ old -> old) k top m') m
-      (S.filter isCodePointer roots)
-       
-    isCodePointer :: CodeAddr -> Bool
-    isCodePointer val = addrHasPermissions (fromIntegral val) pf_x mem
-
-       
 ------------------------------------------------------------------------
 -- Pretty printing utilities (copied)
 
@@ -380,27 +514,31 @@ bracketsep [] = text "{}"
 bracketsep (h:l) =
   vcat ([text "{" <+> h] ++ fmap (text "," <+>) l ++ [text "}"])
 
-ppValueEq :: N.RegisterName cl -> AbsValue' (N.RegisterType cl) -> Maybe Doc
-ppValueEq r v = pp <$> concretize (unAbsValue' v)
-  where
-    pp vs =  text (show r) <+> text "="
-             <+> encloseSep lbrace rbrace comma (map (\v' -> text (showHex v' "")) ( S.toList vs))
+ppValueEq :: (PrettyF d, AbsDomain d)
+             => N.RegisterName cl -> d (N.RegisterType cl) -> Maybe Doc
+ppValueEq r v -- FIXME: doing this to detect top is ugly
+  | isTop v   = Nothing
+  | otherwise = Just $ text (show r) <+> text "=" <+> prettyF v
 
 -- | Pretty print  a register equals a value.
-rec :: N.RegisterName cl -> AbsValue' (N.RegisterType cl) -> Maybe Doc
+rec :: (PrettyF d, AbsDomain d)
+       => N.RegisterName cl -> d (N.RegisterType cl) -> Maybe Doc
 rec nm v = ppValueEq nm v
 
-recv :: (Int -> N.RegisterName cl)
-        -> V.Vector (AbsValue' (N.RegisterType cl)) -> [Maybe Doc]
+recv :: (PrettyF d, AbsDomain d) => (Int -> N.RegisterName cl)
+        -> V.Vector (d (N.RegisterType cl)) -> [Maybe Doc]
 recv mkR v = f <$> [0..V.length v - 1]
   where
     f i = ppValueEq (mkR i) (v V.! i)
 
-parenIf :: Bool -> Doc -> Doc
-parenIf True d = parens d
-parenIf False d = d
-
-instance Pretty AbsBlockState where
+-- FIXME: move
+class PrettyF (f :: k -> *) where
+  prettyF     :: f a -> Doc
+  
+  prettyListF :: [f a] -> Doc
+  prettyListF = list . map prettyF
+  
+instance (AbsDomain d, PrettyF d) => Pretty (AbsBlockState d) where
   pretty (AbsBlockState s) =
     bracketsep $ catMaybes ([ rec   N.rip (s^.curIP)]
                             ++ recv N.GPReg (s^.reg64Regs)
@@ -410,3 +548,4 @@ instance Pretty AbsBlockState where
                             ++ recv N.X87TagReg (s^.x87TagWords)
                             ++ recv N.X87FPUReg (s^.x87Regs)
                             ++ recv N.XMMReg (s^.xmmRegs))
+

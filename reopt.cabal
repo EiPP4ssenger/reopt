@@ -42,6 +42,7 @@ library
     Reopt.Semantics.DeadRegisterElimination
     Reopt.Semantics.CodePointerDiscovery
     Reopt.Semantics.CFGDiscovery
+    Reopt.Semantics.AbsDomain
     Reopt.Semantics.WorkList
 
   ghc-options: -Wall

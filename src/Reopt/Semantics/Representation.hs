@@ -19,6 +19,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Reopt.Semantics.Representation
   ( CFG
@@ -38,8 +39,10 @@ module Reopt.Semantics.Representation
   , TermStmt(..)
   , Assignment(..)
   , assignmentType
+  , assignRhsType
   , AssignId
   , AssignRhs(..)
+  , ppAssignId
     -- * Value
   , Value(..)
   , valueAsApp
@@ -56,6 +59,7 @@ module Reopt.Semantics.Representation
   , X86State'(..)
   , X86State
   , mkX86State
+  , mkX86StateM
   , register
   , curIP
   , reg64Regs
@@ -68,6 +72,8 @@ module Reopt.Semantics.Representation
   , flagRegs
   , foldX86StateValue
   , zipWithX86State
+  , zipWithX86StateM    
+  , mapX86State
   , mapX86State
   , cmpX86State
     --
@@ -107,7 +113,6 @@ import qualified Reopt.Semantics.StateNames as N
 -- Note:
 -- The declarations in this file follow a top-down order, so the top-level
 -- definitions should be first.
-
 
 type Prec = Int
 
@@ -463,25 +468,33 @@ zipWithX86State :: (forall u. f u -> g u -> h u)
                    -> X86State' f
                    -> X86State' g
                    -> X86State' h
-zipWithX86State f x y = mkX86State (\r -> f (x ^. register r) (y ^. register r))
+zipWithX86State f x y = runIdentity $ zipWithX86StateM (\a b -> Identity $ f a b) x y
+
+zipWithX86StateM :: Monad m => (forall u. f u -> g u -> m (h u))
+                   -> X86State' f
+                   -> X86State' g
+                   -> m (X86State' h)
+zipWithX86StateM f x y = mkX86StateM (\r -> f (x ^. register r) (y ^. register r))
 
 mapX86State :: (forall u. f u -> g u)
                -> X86State' f
                -> X86State' g
 mapX86State f x = mkX86State (\r -> f (x ^. register r))
 
+mkX86StateM :: Monad m => (forall cl. N.RegisterName cl -> m (f (N.RegisterType cl))) -> m (X86State' f)
+mkX86StateM f = do _curIP <- f N.IPReg
+                   _reg64Regs      <- V.generateM 16 (f . N.GPReg)
+                   _flagRegs       <- V.generateM 32 (f . N.FlagReg)
+                   _x87ControlWord <- V.generateM 16 (f . N.X87ControlReg)
+                   _x87StatusWord  <- V.generateM 16 (f . N.X87StatusReg)
+                   _x87TopReg      <- f N.X87TopReg
+                   _x87TagWords    <- V.generateM 8 (f . N.X87TagReg)
+                   _x87Regs        <- V.generateM 8 (f . N.X87FPUReg)
+                   _xmmRegs        <- V.generateM 8 (f . N.XMMReg)
+                   return X86State {..}
+
 mkX86State :: (forall cl. N.RegisterName cl -> f (N.RegisterType cl)) -> X86State' f
-mkX86State f =               
-  X86State { _curIP = f N.IPReg
-           , _reg64Regs = V.generate 16 (f . N.GPReg)
-           , _flagRegs  = V.generate 32 (f . N.FlagReg)
-           , _x87ControlWord = V.generate 16 (f . N.X87ControlReg)
-           , _x87StatusWord = V.generate 16 (f . N.X87StatusReg)
-           , _x87TopReg   = f N.X87TopReg
-           , _x87TagWords = V.generate 8 (f . N.X87TagReg)
-           , _x87Regs = V.generate 8 (f . N.X87FPUReg)
-           , _xmmRegs = V.generate 8 (f . N.XMMReg)
-           }
+mkX86State f = runIdentity (mkX86StateM (Identity . f))
 
 register :: forall f cl. N.RegisterName cl
             -> Simple Lens (X86State' f) (f (N.RegisterType cl))
