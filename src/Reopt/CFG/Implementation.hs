@@ -686,7 +686,7 @@ modState m = modGenState $ do
 newAssignID :: X86Generator st_s ids (AssignId ids tp)
 newAssignID = do
   gs <- X86G $ ask
-  liftM AssignId $ X86G $ lift $ lift $ lift $ freshNonce $ assignIdGen gs
+  X86G $ lift $ lift $ lift $ freshAssignId $ assignIdGen gs
 
 addStmt :: Stmt X86_64 ids -> X86Generator st_s ids ()
 addStmt stmt = seq stmt $

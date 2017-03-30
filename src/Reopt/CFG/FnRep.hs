@@ -4,22 +4,22 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE RankNTypes #-}
-
 module Reopt.CFG.FnRep
    ( FnAssignId(..)
    , FnAssignment(..)
    , FnAssignRhs(..)
    , FnValue(..)
    , Function(..)
+   , FunPredMap
+   , ppFunPredMap
    , FunctionType(..)
    , FnBlock(..)
    , FnStmt(..)
    , FnTermStmt(..)
-   , FnRegValue(..)
    , FnPhiVar(..)
    , FnReturnVar(..)
    , FoldFnValue(..)
-   , PhiBinding(..)
+   , PhiValueMap
    , fnAssignRHSType
    , fnValueType
    , fnValueWidth
@@ -31,6 +31,8 @@ module Reopt.CFG.FnRep
    ) where
 
 import           Data.Foldable
+import           Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import           Data.Text (Text)
 import qualified Data.Text as Text
 import           Data.Word
@@ -49,7 +51,6 @@ import           Data.Macaw.CFG
    , sexpr
    , appType
    , foldAppl
-   , prettyF
    )
 import           Data.Macaw.Memory (SegmentedAddr)
 import           Data.Macaw.Types
@@ -130,7 +131,8 @@ ftFloatRetRegs ft = take (fnNFloatRets ft) x86FloatResultRegs
 
 data FnPhiVar (tp :: Type) =
   FnPhiVar { unFnPhiVar :: !FnAssignId
-           , fnPhiVarType :: !(TypeRepr tp) }
+           , fnPhiVarType :: !(TypeRepr tp)
+           }
 
 instance TestEquality FnPhiVar where
   testEquality x y = orderingF_refl (compareF x y)
@@ -188,15 +190,6 @@ fnAssignRHSType rhs =
     FnAlloca _ -> knownType
     FnRepnzScas{} -> knownType
 
-class FoldFnValue a where
-  foldFnValue :: (forall u . s -> FnValue u -> s) -> s -> a -> s
-
-instance FoldFnValue (FnAssignRhs tp) where
-  foldFnValue _ s (FnSetUndefined {}) = s
-  foldFnValue f s (FnReadMem loc _)   = f s loc
-  foldFnValue f s (FnEvalApp a)       = foldAppl f s a
-  foldFnValue f s (FnAlloca sz)       = s `f` sz
-  foldFnValue f s (FnRepnzScas _ val buf cnt) = s `f` val `f` buf `f` cnt
 
 -- tp <- {BVType 64, BVType 128}
 data FnReturnVar tp = FnReturnVar { frAssignId :: !FnAssignId
@@ -225,7 +218,6 @@ data FnValue (tp :: Type)
    | (tp ~ BVType 64) => FnBlockValue !(SegmentedAddr 64)
       -- | Value is a argument passed via a register.
    | FnRegArg !(X86Reg tp) !Int
-
      -- | A global address
    | (tp ~ BVType 64) => FnGlobalDataAddr !(SegmentedAddr 64)
 
@@ -263,66 +255,20 @@ fnValueWidth :: FnValue (BVType w) -> NatRepr w
 fnValueWidth = type_width . fnValueType
 
 ------------------------------------------------------------------------
--- Function definitions
+-- FoldFnValue
 
-data Function = Function { fnAddr :: !(SegmentedAddr 64)
-                           -- ^ In memory address of function
-                         , fnType :: !FunctionType
-                         , fnBlocks :: [FnBlock]
-                         }
+class FoldFnValue a where
+  foldFnValue :: (forall u . s -> FnValue u -> s) -> s -> a -> s
 
-instance Pretty Function where
-  pretty fn =
-    text "function " <+> pretty (show (fnAddr fn))
-    <$$>
-    lbrace
-    <$$>
-    (nest 4 $ vcat (pretty <$> fnBlocks fn))
-    <$$>
-    rbrace
+instance FoldFnValue (FnAssignRhs tp) where
+  foldFnValue _ s (FnSetUndefined {}) = s
+  foldFnValue f s (FnReadMem loc _)   = f s loc
+  foldFnValue f s (FnEvalApp a)       = foldAppl f s a
+  foldFnValue f s (FnAlloca sz)       = s `f` sz
+  foldFnValue f s (FnRepnzScas _ val buf cnt) = s `f` val `f` buf `f` cnt
 
-instance FoldFnValue Function where
-  foldFnValue f s0 fn = foldl' (foldFnValue f) s0 (fnBlocks fn)
-
-data FnRegValue tp
-   = CalleeSaved !(X86Reg tp)
-     -- ^ This is a callee saved register.
-   | FnRegValue !(FnValue tp)
-     -- ^ A value assigned to a register
-
-instance Pretty (FnRegValue tp) where
-  pretty (CalleeSaved r)     = text "calleeSaved" <> parens (text $ show r)
-  pretty (FnRegValue v)      = pretty v
-
-data PhiBinding tp
-   = PhiBinding (FnPhiVar tp) [(BlockLabel 64, X86Reg tp)]
-
--- | A block in the function
-data FnBlock
-   = FnBlock { fbLabel :: !(BlockLabel 64)
-               -- | List of function bindings.
-             , fbPhiNodes  :: ![Some PhiBinding]
-             , fbStmts :: ![FnStmt]
-             , fbTerm  :: !(FnTermStmt)
-             , fbRegMap :: !(MapF X86Reg FnRegValue)
-             }
-
-instance Pretty FnBlock where
-  pretty b =
-    pretty (fbLabel b) <$$>
-    indent 2 (ppPhis
-              <$$> vcat (pretty <$> fbStmts b)
-              <$$> pretty (fbTerm b))
-    where
-      ppPhis = vcat (go <$> fbPhiNodes b)
-      go :: Some PhiBinding -> Doc
-      go (Some (PhiBinding aid vs)) =
-         pretty aid <+> text ":= phi " <+> hsep (punctuate comma $ map goLbl vs)
-      goLbl :: (BlockLabel 64, X86Reg tp) -> Doc
-      goLbl (lbl, node) = parens (pretty lbl <> comma <+> prettyF node)
-
-instance FoldFnValue FnBlock where
-  foldFnValue f s0 b = foldFnValue f (foldl (foldFnValue f) s0 (fbStmts b)) (fbTerm b)
+------------------------------------------------------------------------
+-- FnStmt
 
 data FnStmt
   = forall tp . FnWriteMem !(FnValue (BVType 64)) !(FnValue tp)
@@ -372,6 +318,9 @@ instance FoldFnValue FnStmt where
   foldFnValue f s (FnAssignStmt (FnAssignment _ rhs)) = foldFnValue f s rhs
   foldFnValue f s (FnMemCopy _sz cnt src dest rev)    = s `f` cnt `f` src `f` dest `f` rev
   foldFnValue f s (FnMemSet cnt v ptr df)             = s `f` cnt `f` v `f` ptr `f` df
+
+------------------------------------------------------------------------
+-- FnTermStmt
 
 data FnTermStmt
    = FnJump !(BlockLabel 64)
@@ -423,3 +372,68 @@ instance FoldFnValue FnTermStmt where
     foldl f (f s call_no) args
   foldFnValue f s (FnLookupTable idx _) = s `f` idx
   foldFnValue _ s (FnTermStmtUndefined {}) = s
+
+------------------------------------------------------------------------
+-- FnBlock
+
+
+-- | Map phi variable in a successor block to the value to bind it to.
+type PhiValueMap = MapF FnPhiVar FnValue
+
+-- | A block in the function
+data FnBlock
+   = FnBlock { fbLabel :: !(BlockLabel 64)
+               -- | List of function bindings.
+             , fbPhiNodes  :: ![Some FnPhiVar]
+             , fbStmts :: ![FnStmt]
+             , fbTerm  :: !FnTermStmt
+--             , fbRegMap :: !(MapF X86Reg FnRegValue)
+             , fbAssignMap :: !(Map (BlockLabel 64) PhiValueMap)
+               -- ^ Maps labels of next blocks to the phi bindings
+             }
+
+instance Pretty FnBlock where
+  pretty b =
+    pretty (fbLabel b) <$$>
+    indent 2 (ppPhis
+              <$$> vcat (pretty <$> fbStmts b)
+              <$$> pretty (fbTerm b))
+    where
+      ppPhis = vcat (go <$> fbPhiNodes b)
+      go :: Some FnPhiVar -> Doc
+      go (Some v) = pretty v
+--      goLbl :: (BlockLabel 64, X86Reg tp) -> Doc
+--      goLbl (lbl, node) = parens (pretty lbl <> comma <+> prettyF node)
+
+instance FoldFnValue FnBlock where
+  foldFnValue f s0 b = foldFnValue f (foldl (foldFnValue f) s0 (fbStmts b)) (fbTerm b)
+
+------------------------------------------------------------------------
+-- Function definitions
+
+type FunPredMap w = Map (BlockLabel w) [BlockLabel w]
+
+ppFunPredMap :: FunPredMap w -> Doc
+ppFunPredMap m = vcat (ppEntry <$> Map.toList m)
+  where ppEntry (lbl, preds) = pretty lbl <+> text ":=" <+> hsep (pretty <$> preds)
+
+
+data Function = Function { fnAddr :: !(SegmentedAddr 64)
+                           -- ^ In memory address of function
+                         , fnType :: !FunctionType
+                         , fnBlocks :: [FnBlock]
+                         , fnBlockPredMap :: !(FunPredMap 64)
+                         }
+
+instance Pretty Function where
+  pretty fn =
+    text "function " <+> pretty (show (fnAddr fn))
+    <$$>
+    lbrace
+    <$$>
+    (nest 4 $ vcat (pretty <$> fnBlocks fn))
+    <$$>
+    rbrace
+
+instance FoldFnValue Function where
+  foldFnValue f s0 fn = foldl' (foldFnValue f) s0 (fnBlocks fn)

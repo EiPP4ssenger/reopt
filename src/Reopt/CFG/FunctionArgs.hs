@@ -14,6 +14,7 @@ module Reopt.CFG.FunctionArgs
   ( functionDemands
   , inferFunctionTypeFromDemands
   , functionArgs
+  , AddrToFunctionTypeMap
   , debugPrintMap
   , stmtDemandedValues
   ) where
@@ -743,14 +744,17 @@ inferFunctionTypeFromDemands dm =
                         dm
                         retDemands
 
+-- | Map from address to type of function at that address
+type AddrToFunctionTypeMap = Map (SegmentedAddr 64) FunctionType
+
 -- | Returns the set of argument registers and result registers for each function.
 functionArgs :: SyscallPersonality X86_64
              -> DiscoveryInfo X86_64 ids
              -> [SegmentedAddr 64]
-             -> Map (SegmentedAddr 64) FunctionType
+             -> AddrToFunctionTypeMap
 functionArgs sysp info args = inferFunctionTypeFromDemands $ functionDemands sysp info args
 
-debugPrintMap :: DiscoveryInfo X86_64 ids -> Map (SegmentedAddr 64) FunctionType -> String
+debugPrintMap :: DiscoveryInfo X86_64 ids -> AddrToFunctionTypeMap -> String
 debugPrintMap ist m = "Arguments: \n\t" ++ intercalate "\n\t" (Map.elems comb)
   where -- FIXME: ignores those functions we don't have names for.
         comb = Map.intersectionWith doOne (symbolNames ist) m

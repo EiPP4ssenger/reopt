@@ -1,15 +1,34 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ViewPatterns #-}
-
 module Reopt.CFG.RegisterUse
-  ( FunPredMap
-  , funBlockPreds
-  , AddrToFunctionTypeMap
+  ( -- * Block predecessors
+    funBlockPreds
+  , nextLabelsForTermStmt
+    -- * Dependency information
+  , DependencySet
+  , depAssignments
+  , depRegisters
+    -- ** Post dependency map
+  , DependencyContext
+  , dependencyContext
+  , PostDependencyMap
+  , postDependencyMap
+  , blockPostDependencies
+  , PreDependencyMap
+  , preDependencyMap
+  , preDependencyMapEntries
+  , blockPreDependencies
+    -- * TypedAssignId
+  , TypedAssignId(..)
+    -- * Register usage
   , DemandedUseMap
   , ppDemandedUseMap
   , registerUse
@@ -17,10 +36,11 @@ module Reopt.CFG.RegisterUse
 
 import           Control.Lens
 import           Control.Monad.State.Strict
-import           Data.Foldable as Fold (traverse_)
+import           Data.Foldable as Fold (foldl', foldr', traverse_)
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import           Data.Maybe (fromMaybe)
+import           Data.Parameterized.Classes (TestEquality(..), OrdF(..))
 import           Data.Parameterized.Some
 import           Data.Set (Set)
 import qualified Data.Set as Set
@@ -40,16 +60,29 @@ import           Reopt.CFG.FnRep ( FunctionType(..)
                                  , ftArgRegs
                                  , ftIntRetRegs
                                  , ftFloatRetRegs
+                                 , FunPredMap
                                  )
-import           Reopt.CFG.FunctionArgs (stmtDemandedValues)
+import           Reopt.CFG.FunctionArgs (AddrToFunctionTypeMap
+                                        , stmtDemandedValues
+                                        )
 import           Reopt.Machine.X86State
+
+-------------------------------------------------------------------------------
+-- Urilities
+
+-- | Return the parsed block with the given label
+lookupFunBlock :: DiscoveryFunInfo arch ids -> ArchLabel arch -> Maybe (ParsedBlock arch ids)
+lookupFunBlock finfo lbl = do
+  reg <- Map.lookup (labelAddr lbl) (finfo^.parsedBlocks)
+  Map.lookup (labelIndex lbl) (regionBlockMap reg)
+
 
 -------------------------------------------------------------------------------
 -- funBlockPreds
 
 -- | Return intra-procedural labels this will jump to.
-termSucc :: SegmentedAddr 64 -> ParsedTermStmt X86_64 ids -> [BlockLabel 64]
-termSucc addr stmt =
+nextLabelsForTermStmt :: SegmentedAddr 64 -> ParsedTermStmt X86_64 ids -> [BlockLabel 64]
+nextLabelsForTermStmt addr stmt =
   case stmt of
     ParsedCall _ (Just ret_addr) -> [mkRootBlockLabel ret_addr]
     ParsedCall _ Nothing -> []
@@ -60,8 +93,6 @@ termSucc addr stmt =
     ParsedSyscall _ ret -> [mkRootBlockLabel ret]
     ParsedTranslateError{} -> []
     ClassifyFailure{} -> []
-
-type FunPredMap w = Map (BlockLabel w) [BlockLabel w]
 
 -- | This function figures out what the block requires
 -- (i.e., addresses that are stored to, and the value stored), along
@@ -78,8 +109,296 @@ funBlockPreds info = Map.fromListWith (++)
     -- Create index for input block
   , let prev = GeneratedBlock addr idx
     -- Create input for next block
-  , next <- termSucc addr (pblockTerm block)
+  , next <- nextLabelsForTermStmt addr (pblockTerm block)
   ]
+
+
+-------------------------------------------------------------------------------
+-- TypedAssignId
+
+data TypedAssignId ids tp = TypedAssignId { typedAssignIdValue :: !(AssignId ids tp)
+                                          , typedAssignIdType :: !(TypeRepr tp)
+                                          }
+
+instance TestEquality  (TypedAssignId ids) where
+  testEquality x y = testEquality (typedAssignIdValue x) (typedAssignIdValue y)
+
+instance OrdF (TypedAssignId ids) where
+  compareF x y = compareF (typedAssignIdValue x) (typedAssignIdValue y)
+
+instance HasRepr (TypedAssignId ids) TypeRepr where
+  typeRepr = typedAssignIdType
+
+-------------------------------------------------------------------------------
+-- DependencySet
+
+
+-- | A collection of data dependencies for a block
+data DependencySet (reg :: Type -> *) ids
+   = DependencySet { _depAssignments :: !(Set (Some (TypedAssignId ids)))
+                   -- ^ Assignments in the dependency set.
+                   , _depRegisters   :: !(Set (Some reg))
+                   -- ^ Registers in the dependency set.
+                   }
+
+-- | Assignments in the dependency set.
+depAssignments :: Simple Lens (DependencySet reg ids) (Set (Some (TypedAssignId ids)))
+depAssignments = lens _depAssignments (\s v -> s { _depAssignments = v })
+
+-- | Registers in the dependency set.
+depRegisters :: Simple Lens (DependencySet reg ids) (Set (Some reg))
+depRegisters = lens _depRegisters (\s v -> s { _depRegisters = v })
+
+-- | The empty set of dependencies
+emptyDependencySet :: DependencySet reg ids
+emptyDependencySet = DependencySet { _depAssignments = Set.empty
+                                   , _depRegisters  = Set.empty
+                                   }
+
+-- | `addDepSet x y` returns a pair `(z,changed)` where `z` is the union of `x` and `y`, and
+-- `changed` is true if `z` does not equal `y`.
+addDepSet :: OrdF reg => DependencySet reg ids -> DependencySet reg ids -> (DependencySet reg ids, Bool)
+addDepSet x y = (z,changed)
+  where z_assign = Set.union (x^.depAssignments) (y^.depAssignments)
+        z_regs   = Set.union (x^.depRegisters)   (y^.depRegisters)
+        z = DependencySet { _depAssignments = z_assign
+                          , _depRegisters = z_regs
+                          }
+        changed = Set.size z_assign > Set.size (y^.depAssignments)
+               || Set.size z_regs   > Set.size (y^.depRegisters)
+
+addValueDependency :: OrdF (ArchReg arch)
+                   => Value arch ids tp
+                   -> DependencySet (ArchReg arch) ids
+                   -> DependencySet (ArchReg arch) ids
+addValueDependency val deps =
+  case val of
+    BVValue{}          -> deps
+    RelocatableValue{} -> deps
+    AssignedValue a    -> deps & depAssignments %~ Set.insert (Some (TypedAssignId (assignId a) (typeRepr a)))
+    Initial r          -> deps & depRegisters %~ Set.insert (Some r)
+
+-- | Resolve register dependencies given register state and compute dependencies just prior to update
+reverseRegisterDependencies :: forall arch ids
+                            .  OrdF (ArchReg arch)
+                            => RegState (ArchReg arch) (Value arch ids)
+                            -> DependencySet (ArchReg arch) ids
+                            -> DependencySet (ArchReg arch) ids
+reverseRegisterDependencies regs s0 = foldl' go (s0 & depRegisters .~ Set.empty) (s0^.depRegisters)
+  where go :: DependencySet (ArchReg arch) ids -> Some (ArchReg arch) -> DependencySet (ArchReg arch) ids
+        go deps (Some r) = addValueDependency (regs^.boundValue r) deps
+
+-- | Restrict the registers that are dependencies to only those in the list.
+restrictDepRegs :: OrdF reg => [Some reg] -> DependencySet reg ids -> DependencySet reg ids
+restrictDepRegs regs deps = deps & depRegisters %~ Set.intersection (Set.fromList regs)
+
+-----------------------------------------------------------------------
+-- Dependency resolution
+
+addAssignRhsDependency :: AssignRhs X86_64 ids tp
+                       -> DependencySet X86Reg ids
+                       -> DependencySet X86Reg ids
+addAssignRhsDependency rhs deps =
+  case rhs of
+    EvalApp app -> foldAppl (flip addValueDependency) deps app
+    SetUndefined{} -> deps
+    ReadMem addr _-> deps & addValueDependency addr
+    EvalArchFn afn _ -> foldl' (\d (Some v) -> d & addValueDependency v) deps (valuesInX86PrimFn afn)
+
+-- | Information needed to resolve basic block dependencies within a function
+data DependencyContext ids = DependencyContext
+  { syscallInfo :: !(SyscallPersonality X86_64)
+  , globalMem :: !(Memory 64)
+    -- ^ State of memory
+  , funTypeMap :: !AddrToFunctionTypeMap
+    -- ^ Map from addresses to function type
+  , ctxCurrentFunctionType :: !FunctionType
+    -- ^ Type of this function
+  , dctxFunInfo :: !(DiscoveryFunInfo X86_64 ids)
+  }
+
+dependencyContext :: SyscallPersonality X86_64
+                  -> Memory 64
+                  -> AddrToFunctionTypeMap
+                  -> DiscoveryFunInfo X86_64 ids -- ^ Function information
+                  -> DependencyContext ids
+dependencyContext sysp mem ftypes finfo = dctx
+  where -- Get type of this function
+        curType = fromMaybe ftMaximumFunctionType $ Map.lookup (discoveredFunAddr finfo) ftypes
+        -- Make dependency context
+        dctx = DependencyContext { syscallInfo = sysp
+                                 , globalMem = mem
+                                 , funTypeMap = ftypes
+                                 , ctxCurrentFunctionType = curType
+                                 , dctxFunInfo = finfo
+                                 }
+
+-- | Given a term statement and a set of dependencies post execution,
+-- this returns dependencies prior to execution.
+stmtRevDependencies :: Stmt X86_64 ids
+                       -- ^ Statement to reverse
+                    -> DependencySet X86Reg ids
+                       -- ^ Dependencies after statement running
+                    -> DependencySet X86Reg ids
+stmtRevDependencies stmt deps =
+  case stmt of
+    AssignStmt asgn ->
+      deps & depAssignments %~ Set.delete (Some (TypedAssignId (assignId asgn) (typeRepr asgn)))
+           & addAssignRhsDependency (assignRhs asgn)
+    WriteMem addr val ->
+      deps & addValueDependency addr
+           & addValueDependency val
+    PlaceHolderStmt{} -> deps
+    Comment{} -> deps
+    ExecArchStmt astmt ->
+      foldl' (\d (Some v) -> d & addValueDependency v) deps (valuesInX86Stmt astmt)
+
+-- | Given a term statement and a set of dependencies post execution,
+-- this returns dependencies prior to execution.
+termStmtRevDependencies :: DependencyContext ids
+                        -> ParsedTermStmt X86_64 ids
+                           -- ^ term stmt
+                        -> DependencySet X86Reg ids
+                           -- ^ Dependencies after term statement running
+                        -> DependencySet X86Reg ids
+termStmtRevDependencies dctx tstmt deps =
+  case tstmt of
+    ParsedCall regs _ ->
+           -- Get list of registers that have the same value post- and pre-call.
+      let saved_regs = (Some sp_reg : Set.toList x86CalleeSavedRegs)
+          -- Get function type associated with function
+          ft | Just faddr <- asLiteralAddr (globalMem dctx) (regs^.boundValue ip_reg)
+             , Just ftp <- Map.lookup faddr (funTypeMap dctx) =
+               ftp
+             | otherwise =
+               ftMaximumFunctionType
+       in deps & restrictDepRegs saved_regs
+               & depRegisters %~ (`Set.union` Set.fromList (Some ip_reg : ftArgRegs ft))
+               & reverseRegisterDependencies regs
+    ParsedJump regs _ ->
+      deps & reverseRegisterDependencies regs
+    ParsedLookupTable regs idx _ ->
+      deps & reverseRegisterDependencies regs
+           & addValueDependency idx
+    ParsedReturn regs -> do
+      let ftype = ctxCurrentFunctionType dctx
+          needed_regs = (Some <$> take (fnNIntRets ftype)    x86ResultRegs)
+                     ++ (Some <$> take (fnNFloatRets ftype) x86FloatResultRegs)
+                  -- Set dependencies to return values
+       in deps & depRegisters .~ Set.fromList needed_regs
+                 -- Compute dependencies
+               & reverseRegisterDependencies regs
+    ParsedBranch v _ _ ->
+      deps & addValueDependency v
+    ParsedSyscall regs _ ->
+      let -- Get list of registers that have the same value post- and pre-call.
+          saved_regs = (Some sp_reg : Set.toList x86CalleeSavedRegs)
+          -- Register for system call
+          sysReg ::  ArchReg X86_64 (BVType 64)
+          sysReg = syscall_num_reg
+          -- Get arguments registers if this is a static system call number
+          argRegs :: [ArchReg X86_64 (BVType 64)]
+          argRegs
+            | BVValue _ call_no <- regs^.boundValue syscall_num_reg
+            , Just (_,_,argtypes) <- Map.lookup (fromInteger call_no) (spTypeInfo (syscallInfo dctx)) =
+              take (length argtypes) syscallArgumentRegs
+            | otherwise =
+              syscallArgumentRegs
+       in deps & restrictDepRegs saved_regs
+                 -- Add argument registers
+               & depRegisters %~ (`Set.union` Set.fromList (Some <$> (sysReg : argRegs)))
+               & reverseRegisterDependencies regs
+    ParsedTranslateError{} ->
+      emptyDependencySet
+    ClassifyFailure{} ->
+      emptyDependencySet
+
+-- | Given the dependencies after a block executes, compute the dependencies from before it executes
+mkBlockPreDependencies :: DependencyContext ids
+                       -> ParsedBlock X86_64 ids
+                          -- ^ Parsed block
+                       -> DependencySet X86Reg ids
+                          -- ^ Dependencies after term statement running
+                       -> DependencySet X86Reg ids
+mkBlockPreDependencies dctx pblock deps =
+  let deps1 = deps & termStmtRevDependencies dctx (pblockTerm pblock)
+   in foldr' stmtRevDependencies deps1 (pblockStmts pblock)
+
+-- | Maps each label to the set of dependencies it is expected to provide.
+newtype PostDependencyMap reg ids
+      = PostDependencyMap { postMap :: Map (BlockLabel (RegAddrWidth reg)) (DependencySet reg ids) }
+
+-- | Get dependency set for the given label
+blockPostDependencies :: BlockLabel (RegAddrWidth reg) -> PostDependencyMap reg ids -> DependencySet reg ids
+blockPostDependencies lbl m = fromMaybe emptyDependencySet (Map.lookup lbl (postMap m))
+
+-- | Iterative method to compute post-dependency map
+stepPostDepInfer :: forall ids
+                 .  DependencyContext ids -- ^ Context
+                 -> FunPredMap 64 -- ^ Block predecessor map
+                 -> Set (BlockLabel 64) -- ^ Labels left to recompute dependencies
+                 -> Map (BlockLabel 64) (DependencySet X86Reg ids)
+                 -> Map (BlockLabel 64) (DependencySet X86Reg ids)
+stepPostDepInfer dctx predMap frontier depMap =
+  case Set.maxView frontier of
+     Nothing -> depMap
+     Just (lbl, next_frontier) ->
+       let post_deps = fromMaybe emptyDependencySet (Map.lookup lbl depMap)
+           -- Lookup block information
+           Just block = lookupFunBlock (dctxFunInfo dctx) lbl
+           -- Compute dependencies at start of block
+           pre_deps = mkBlockPreDependencies dctx block post_deps
+
+           -- Iterate through the block predecessors and add pre_deps to them.
+           process :: [BlockLabel 64]
+                      -- ^ Predecessors
+                   -> Set (BlockLabel 64)
+                   -- ^ Next frontier
+                   -> Map (BlockLabel 64) (DependencySet X86Reg ids)
+                   -> Map (BlockLabel 64) (DependencySet X86Reg ids)
+           process [] s m = stepPostDepInfer dctx predMap s m
+           process (pred_lbl:rest) s m =
+             let (newDeps, changed) = addDepSet pre_deps $ fromMaybe emptyDependencySet $ Map.lookup pred_lbl m
+              in if changed then
+                   process rest (Set.insert pred_lbl s) (Map.insert pred_lbl newDeps m)
+                  else
+                   process rest s m
+        in process (fromMaybe [] $ Map.lookup lbl predMap) next_frontier depMap
+
+postDependencyMap :: DependencyContext ids
+                  -> FunPredMap 64
+                  -> PostDependencyMap X86Reg ids
+postDependencyMap dctx predMap =
+    PostDependencyMap { postMap = stepPostDepInfer dctx predMap (Set.fromList labels) Map.empty
+                      }
+  where -- All labels
+        labels = [ GeneratedBlock (regionAddr reg) (pblockLabel block)
+                 | reg <- Map.elems (dctxFunInfo dctx^.parsedBlocks)
+                 , block <- Map.elems (regionBlockMap reg)
+                 ]
+
+-------------------------------------------------------------------------------
+-- PreDependencyMap
+
+-- | This maps blocks to the dependencies prior to exeuction
+newtype PreDependencyMap reg ids
+      = PreDependencyMap { preDependencyMapEntries :: Map (BlockLabel (RegAddrWidth reg)) (DependencySet reg ids) }
+
+-- | Compute the pre-dependency map given a post-dependency map
+preDependencyMap :: forall ids
+                 .  DependencyContext ids
+                 -> PostDependencyMap X86Reg ids
+                 -> PreDependencyMap  X86Reg ids
+preDependencyMap ctx (PostDependencyMap m) = PreDependencyMap (Map.mapWithKey go m)
+  where go :: BlockLabel 64 -> DependencySet X86Reg ids -> DependencySet X86Reg ids
+        go lbl s =
+          case lookupFunBlock (dctxFunInfo ctx) lbl of
+            Just b -> mkBlockPreDependencies ctx b s
+            Nothing -> error $ "Could not find block " ++ show lbl
+
+-- | Return the dependencies expected at the set of a block.
+blockPreDependencies :: BlockLabel (RegAddrWidth regs) -> PreDependencyMap regs ids -> DependencySet regs ids
+blockPreDependencies lbl m = fromMaybe emptyDependencySet $ Map.lookup lbl (preDependencyMapEntries m)
 
 -------------------------------------------------------------------------------
 
@@ -87,9 +406,6 @@ funBlockPreds info = Map.fromListWith (++)
 -- and registers (transitively through Apps etc.)
 type RegDeps ids = (Set (Some (AssignId ids)), Set (Some X86Reg))
 type AssignmentCache ids = Map (Some (AssignId ids)) (RegDeps ids)
-
--- | Map from address to type of function at that address
-type AddrToFunctionTypeMap = Map (SegmentedAddr 64) FunctionType
 
 -- The algorithm computes the set of direct deps (i.e., from writes)
 -- and then iterates, propagating back via the register deps.
@@ -259,7 +575,7 @@ summarizeBlock mem interp_state root_label = go root_label
 
 
       -- Update frontier with successor states for terminal
-      blockFrontier %= \s -> foldr Set.insert s (termSucc (labelAddr lbl) (pblockTerm b))
+      blockFrontier %= \s -> foldr Set.insert s (nextLabelsForTermStmt (labelAddr lbl) (pblockTerm b))
 
       case pblockTerm b of
         ParsedCall proc_state _ -> do
@@ -273,7 +589,6 @@ summarizeBlock mem interp_state root_label = go root_label
                     (Some <$> ftIntRetRegs ft)
                     ++ (Some <$> ftFloatRetRegs ft)
                     ++ [Some df_reg]
-
         ParsedJump proc_state _ ->
           addRegisterUses proc_state x86StateRegs
         ParsedLookupTable proc_state _ _ ->

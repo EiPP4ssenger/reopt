@@ -5,12 +5,14 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE ViewPatterns #-}
 module Reopt.CFG.StackDepth
   ( maximumStackDepth
   , StackDepthValue(..)
   , StackDepthOffset(..)
   , stackDepthOffsetValue
+  , maxConstStackDepth
   ) where
 
 import           Control.Lens
@@ -25,32 +27,49 @@ import           Data.Monoid (Any(..))
 import           Data.Parameterized.Classes
 import           Data.Set (Set)
 import qualified Data.Set as Set
+import           Data.Word
 import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>))
 
+import           Data.Macaw.AbsDomain.AbsState
 import           Data.Macaw.Discovery.Info
 import           Data.Macaw.CFG
+import           Data.Macaw.Memory (MemWidth)
 import           Data.Macaw.Types
+
 import           Reopt.Machine.X86State
 
+$(pure [])
+
+-- | A symbolic value indicating a stack offset.
 data StackDepthOffset arch ids
    = Pos (BVValue arch ids (ArchAddrWidth arch))
    | Neg (BVValue arch ids (ArchAddrWidth arch))
+
+$(pure [])
 
 deriving instance OrdF  (ArchReg arch) => Eq (StackDepthOffset arch ids)
 deriving instance OrdF  (ArchReg arch) => Ord (StackDepthOffset arch ids)
 deriving instance ShowF (ArchReg arch) => Show (StackDepthOffset arch ids)
 
+$(pure [])
+
 stackDepthOffsetValue :: StackDepthOffset arch ids -> BVValue arch ids (ArchAddrWidth arch)
 stackDepthOffsetValue (Pos v) = v
 stackDepthOffsetValue (Neg v) = v
+
+$(pure [])
 
 negateStackDepthOffset :: StackDepthOffset arch ids -> StackDepthOffset arch ids
 negateStackDepthOffset (Pos x) = Neg x
 negateStackDepthOffset (Neg x) = Pos x
 
+$(pure [])
+
 isNegativeDepth :: StackDepthOffset arch ids -> Bool
 isNegativeDepth (Neg _) = True
 isNegativeDepth _ = False
+
+$(pure [])
 
 -- One stack expression, basically staticPart + \Sigma dynamicPart
 data StackDepthValue arch ids = SDV { staticPart :: !Int64
@@ -61,6 +80,8 @@ deriving instance OrdF (ArchReg arch) => Eq (StackDepthValue arch ids)
 deriving instance OrdF (ArchReg arch) => Ord (StackDepthValue arch ids)
 deriving instance ShowF (ArchReg arch) => Show (StackDepthValue arch ids)
 
+$(pure [])
+
 instance ShowF (ArchReg arch) => Pretty (StackDepthValue arch ids) where
   pretty sdv = integer (fromIntegral $ staticPart sdv)
                <+> go (Set.toList $ dynamicPart sdv)
@@ -69,14 +90,15 @@ instance ShowF (ArchReg arch) => Pretty (StackDepthValue arch ids) where
       go (Pos x : xs) = text "+" <+> pretty x <+> go xs
       go (Neg x : xs) = text "-" <+> pretty x <+> go xs
 
--- isConstantDepthValue :: StackDepthValue -> Maybe Int64
--- isConstantDepthValue sv
---   | Set.null (dynamicPart sv) = Just (staticPart sv)
---   | otherwise                 = Nothing
+$(pure [])
 
+-- | Create a stack depth for the givne interger
 constantDepthValue :: Int64 -> StackDepthValue arch ids
 constantDepthValue c = SDV c Set.empty
 
+$(pure [])
+
+-- | Add two stack depth values
 addStackDepthValue :: OrdF (ArchReg arch)
                    => StackDepthValue arch ids
                    -> StackDepthValue arch ids
@@ -84,12 +106,17 @@ addStackDepthValue :: OrdF (ArchReg arch)
 addStackDepthValue sdv1 sdv2  = SDV (staticPart sdv1 + staticPart sdv2)
                                     (dynamicPart sdv1 `Set.union` dynamicPart sdv2)
 
+$(pure [])
+
+-- | Negate a stack depth
 negateStackDepthValue :: OrdF (ArchReg arch)
                       => StackDepthValue arch ids
                       -> StackDepthValue arch ids
 negateStackDepthValue sdv = SDV { staticPart  = - (staticPart sdv)
                                 , dynamicPart = Set.map negateStackDepthOffset (dynamicPart sdv)
                                 }
+
+$(pure [])
 
 -- | v1 `subsumes` v2 if a stack of depth v1 is always larger than a
 -- stack of depth v2.  Note that we are interested in negative values
@@ -100,86 +127,80 @@ subsumes v1 v2
   -- FIXME: subsets etc.
   | otherwise = False
 
+$(pure [])
+
 -- could do this online, this helps with debugging though.
-minimizeStackDepthValues :: OrdF (ArchReg arch)
+minimizeStackDepthValues :: forall arch ids
+                         .  OrdF (ArchReg arch)
                          => Set (StackDepthValue arch ids)
                          -> Set (StackDepthValue arch ids)
-minimizeStackDepthValues = Set.fromList . Set.fold go [] . Set.map discardPositive
+minimizeStackDepthValues s = Set.fromList (Set.fold go [] s)
   where
     discardPositive v = v { dynamicPart = Set.filter isNegativeDepth (dynamicPart v) }
     -- FIXME: can we use ordering to simplify this?
-    go v xs = let (_subs, xs') = partition (subsumes v) xs
-                  dominated   = any (`subsumes` v) xs'
-              in if not dominated then v : xs' else xs'
+    go :: StackDepthValue arch ids -> [StackDepthValue arch ids] -> [StackDepthValue arch ids]
+    go v0 xs | dominated = xs'
+             | otherwise = v : xs'
+      where v = discardPositive v0
+            (_subs, xs') = partition (subsumes v) xs
+            dominated   = any (`subsumes` v) xs'
 
 -- -----------------------------------------------------------------------------
+
+$(pure [])
 
 -- For now this is just the set of stack addresses referenced by the
 -- program --- note that as it is partially symbolic, we can't always
 -- statically determine the stack depth (might depend on arguments, for example).
 type BlockStackDepths arch ids = Set (StackDepthValue arch ids)
 
+$(pure [])
+
 -- We use BlockLabel but only really need CodeAddr (sub-blocks shouldn't appear)
 data StackDepthState arch ids
-   = SDS { _blockInitStackPointers :: !(Map (ArchLabel arch) (StackDepthValue arch ids))
+   = SDS { _blockInitStackPointers :: !(Map (ArchSegmentedAddr arch) (StackDepthValue arch ids))
          , _blockStackRefs :: !(BlockStackDepths arch ids)
-         , _blockFrontier  :: ![ArchLabel arch]
+         , _blockFrontier  :: ![ArchSegmentedAddr arch]
            -- ^ Set of blocks to explore next.
          }
 
+$(pure [])
+
 -- | Maps blocks already seen to the expected depth at the start of the block.
 blockInitStackPointers :: Simple Lens (StackDepthState arch ids)
-                                      (Map (ArchLabel arch) (StackDepthValue arch ids))
+                                      (Map (ArchSegmentedAddr arch) (StackDepthValue arch ids))
 blockInitStackPointers = lens _blockInitStackPointers (\s v -> s { _blockInitStackPointers = v })
+
+$(pure [])
 
 blockStackRefs :: Simple Lens (StackDepthState arch ids) (BlockStackDepths arch ids)
 blockStackRefs = lens _blockStackRefs (\s v -> s { _blockStackRefs = v })
 
+$(pure [])
+
 -- | Set of blocks to visit next.
-blockFrontier :: Simple Lens (StackDepthState arch ids) [ArchLabel arch]
+blockFrontier :: Simple Lens (StackDepthState arch ids) [ArchSegmentedAddr arch]
 blockFrontier = lens _blockFrontier (\s v -> s { _blockFrontier = v })
 
 -- ----------------------------------------------------------------------------------------
 
--- FIXME: move
-
--- Unwraps all Apps etc, might visit an app twice (Add x x, for example)
--- foldValue :: forall m tp. Monoid m
---              => (forall n.  NatRepr n -> Integer -> m)
---              -> (forall cl. N.RegisterName cl -> m)
---              -> Value tp -> m
--- foldValue litf initf val = go val
---   where
---     go :: forall tp. Value tp -> m
---     go v = case v of
---              BVValue sz i -> litf sz i
---              Initial r    -> initf r
---              AssignedValue (Assignment _ rhs) -> goAssignRHS rhs
-
---     goAssignRHS :: forall tp. AssignRhs tp -> m
---     goAssignRHS v =
---       case v of
---         EvalApp a -> foldApp go a
---         SetUndefined w -> mempty
---         Read loc
---          | MemLoc addr _ <- loc -> go addr
---          | otherwise            -> mempty -- FIXME: what about ControlLoc etc.
---         MemCmp _sz cnt src dest rev -> mconcat [ go cnt, go src, go dest, go rev ]
-
--- ----------------------------------------------------------------------------------------
+$(pure [])
 
 type StackDepthM arch ids a = ExceptT String (State (StackDepthState arch ids)) a
 
+$(pure [])
+
 addBlock :: (OrdF (ArchReg arch), ShowF (ArchReg arch))
-         => ArchLabel arch
+         => ArchSegmentedAddr arch
          -> StackDepthValue arch ids
          -> StackDepthM arch ids ()
-addBlock lbl start = do
-  x <- use (blockInitStackPointers . at lbl)
-  case x of
+addBlock a start = do
+  let lbl = mkRootBlockLabel a
+  ptrs <- use blockInitStackPointers
+  case Map.lookup a ptrs of
     Nothing     -> do
-      blockInitStackPointers %= Map.insert lbl start
-      blockFrontier %= (lbl:)
+      blockInitStackPointers %= Map.insert a start
+      blockFrontier %= (a:)
     Just old_start
       | start == old_start ->
         return ()
@@ -187,11 +208,15 @@ addBlock lbl start = do
         throwError $ "Block stack depth mismatch at " ++ show (pretty lbl) ++ ": "
              ++ show (pretty start) ++ " and " ++ show (pretty old_start)
 
+$(pure [])
+
 addDepth :: OrdF (ArchReg arch) => Set (StackDepthValue arch ids) -> StackDepthM arch ids ()
 addDepth v = blockStackRefs %= Set.union v
 
 ------------------------------------------------------------------------
 -- Stack pointer detection
+
+$(pure [])
 
 -- | Return true if value references stack pointer
 valueHasSP :: forall ids utp . Value X86_64 ids utp -> Bool
@@ -209,6 +234,9 @@ valueHasSP v0 =
         EvalArchFn (MemCmp _sz cnt src dest rev) _ ->
           or [ valueHasSP cnt, valueHasSP src, valueHasSP dest, valueHasSP rev ]
         _ -> False
+
+$(pure [])
+
 
 parseStackPointer' :: StackDepthValue X86_64 ids
                    -> BVValue X86_64 ids (ArchAddrWidth X86_64)
@@ -229,6 +257,7 @@ parseStackPointer' sp0 addr
                     , dynamicPart = Set.singleton (Pos addr)
                     }
 
+$(pure [])
 
 -- FIXME: performance
 parseStackPointer :: StackDepthValue X86_64 ids
@@ -240,34 +269,7 @@ parseStackPointer sp0 addr0
 
 -- -----------------------------------------------------------------------------
 
--- | Returns the maximum stack argument used by the function, that is,
--- the highest index above sp0 that is read or written.
-maximumStackDepth :: DiscoveryFunInfo X86_64 ids
-                  -> SegmentedAddr 64
-                  -> Either String (BlockStackDepths X86_64 ids)
-maximumStackDepth ist addr = finish $ runState (runExceptT (recoverIter ist lbl0)) s0
-  where
-    s0   = SDS { _blockInitStackPointers = Map.singleton lbl0 sdv0
-               , _blockStackRefs         = Set.empty
-               , _blockFrontier          = []
-               }
-    lbl0 = GeneratedBlock addr 0
-    sdv0 = SDV { staticPart = 0, dynamicPart = Set.empty }
-    finish (Right (), s) = Right $ minimizeStackDepthValues $ s ^. blockStackRefs
-    finish (Left e, _) = Left e
-
--- | Explore states until we have reached end of frontier.
-recoverIter :: DiscoveryFunInfo X86_64 ids
-            -> BlockLabel 64
-            -> StackDepthM X86_64 ids ()
-recoverIter ist lbl = do
-  recoverBlock ist lbl
-  s <- use blockFrontier
-  case s of
-    [] -> return ()
-    next : s' -> do
-      blockFrontier .= s'
-      recoverIter ist next
+$(pure [])
 
 goStmt :: StackDepthValue X86_64 ids -> Stmt X86_64 ids -> StackDepthM X86_64 ids ()
 goStmt init_sp (AssignStmt (Assignment _ (ReadMem addr _))) =
@@ -279,60 +281,248 @@ goStmt init_sp (WriteMem addr v) = do
     _ -> return ()
 goStmt _ _ = return ()
 
-recoverBlock :: DiscoveryFunInfo X86_64 ids
-             -> BlockLabel 64
+$(pure [])
+
+-- | Check each general purpose register to see if we should add a stack pointer
+addStateVars :: StackDepthValue X86_64 ids
+             -> RegState X86Reg (Value X86_64 ids)
              -> StackDepthM X86_64 ids ()
-recoverBlock interp_state root_label = do
-  Just init_sp <- use (blockInitStackPointers . at root_label)
-  go init_sp root_label
+addStateVars init_sp s = do
+  forM_ gpRegList $ \r -> do
+    addDepth $ parseStackPointer init_sp (s ^. boundValue r)
+
+$(pure [])
+
+recoverBlock :: ParsedBlockRegion X86_64 ids
+                -- ^ Region to recover blocks in
+             -> StackDepthValue X86_64 ids
+                -- ^ Value of initial stack pointer
+             -> Word64
+                -- ^ Index of block
+             -> StackDepthM X86_64 ids ()
+recoverBlock region init_sp idx = do
+  Just b <- return $ Map.lookup idx (regionBlockMap region)
+  -- overapproximates by viewing all registers as uses of the
+  -- sp between blocks
+  traverse_ (goStmt init_sp) (pblockStmts b)
+  case pblockTerm b of
+    ParsedTranslateError _ ->
+      throwError "Cannot identify stack depth in code where translation error occurs"
+    ClassifyFailure _ ->
+      throwError $ "Classification failed in StackDepth: " ++ show (regionAddr region)
+    ParsedBranch _c x y -> do
+      recoverBlock region init_sp x
+      recoverBlock region init_sp y
+
+    ParsedCall proc_state m_ret_addr -> do
+      addStateVars init_sp proc_state
+
+      let sp'  = parseStackPointer' init_sp (proc_state ^. boundValue sp_reg)
+      case m_ret_addr of
+        Nothing -> return ()
+        Just ret_addr ->
+          addBlock ret_addr (addStackDepthValue sp' $ constantDepthValue 8)
+
+    ParsedJump proc_state tgt_addr -> do
+      addStateVars init_sp proc_state
+      let sp' = parseStackPointer' init_sp (proc_state ^. boundValue sp_reg)
+      addBlock tgt_addr sp'
+
+    ParsedReturn _proc_state -> do
+      pure ()
+
+    ParsedSyscall proc_state next_addr -> do
+      addStateVars init_sp proc_state
+      let sp'  = parseStackPointer' init_sp (proc_state ^. boundValue sp_reg)
+      addBlock next_addr sp'
+
+    ParsedLookupTable proc_state _idx vec -> do
+      addStateVars init_sp proc_state
+      let sp'  = parseStackPointer' init_sp (proc_state ^. boundValue sp_reg)
+      traverse_ (\a -> addBlock a sp') vec
+
+$(pure [])
+
+-- | Explore states until we have reached end of frontier.
+recoverIter :: DiscoveryFunInfo X86_64 ids
+            -> StackDepthState X86_64 ids
+            -> Either String (StackDepthState X86_64 ids)
+recoverIter finfo s =
+  case s^.blockFrontier of
+    [] -> Right s
+    addr:rest ->
+      case Map.lookup addr (finfo^.parsedBlocks) of
+        Nothing -> Left $ "Stack depth could not find " ++ show addr
+        Just region -> do
+          case Map.lookup (regionAddr region) (s^.blockInitStackPointers) of
+            Nothing -> Left $ "Could not find stack height"
+            Just init_sp -> do
+              let s' = s & blockFrontier .~ rest
+              case runState (runExceptT (recoverBlock region init_sp 0)) s' of
+                (Right (), s2) -> recoverIter finfo s2
+                (Left e, _) -> Left e
+
+$(pure [])
+
+-- | Returns the maximum stack argument used by the function, that is,
+-- the highest index above sp0 that is read or written.
+maximumStackDepth :: DiscoveryFunInfo X86_64 ids
+                  -> SegmentedAddr 64
+                  -> Either String (BlockStackDepths X86_64 ids)
+maximumStackDepth finfo _ =
+    case recoverIter finfo s0 of
+      Right s -> Right $ minimizeStackDepthValues $ s ^. blockStackRefs
+      Left e  -> Left e
   where
-    addStateVars init_sp s = do
-      forM_ gpRegList $ \r -> do
-        addDepth $ parseStackPointer init_sp (s ^. boundValue r)
-    go init_sp lbl = do
-      Just b <- return $ lookupParsedBlock interp_state lbl
-          -- overapproximates by viewing all registers as uses of the
-          -- sp between blocks
+    addr = discoveredFunAddr finfo
+    sdv0 = SDV { staticPart = 0, dynamicPart = Set.empty }
+    s0   = SDS { _blockInitStackPointers = Map.singleton addr sdv0
+               , _blockStackRefs         = Set.empty
+               , _blockFrontier          = [addr]
+               }
 
-      traverse_ (goStmt init_sp) (pblockStmts b)
-      case pblockTerm b of
-        ParsedTranslateError _ ->
-          throwError "Cannot identify stack depth in code where translation error occurs"
-        ClassifyFailure _ ->
-          throwError $ "Classification failed in StackDepth: " ++ show (labelAddr root_label)
-        ParsedBranch _c x y -> do
-          go init_sp (lbl { labelIndex = x })
-          go init_sp (lbl { labelIndex = y })
+$(pure [])
 
-        ParsedCall proc_state m_ret_addr -> do
-          addStateVars init_sp proc_state
+newtype ConstStackDepth = CSD Integer
 
-          let sp'  = parseStackPointer' init_sp (proc_state ^. boundValue sp_reg)
-          case m_ret_addr of
-            Nothing -> return ()
-            Just ret_addr ->
-              addBlock (mkRootBlockLabel ret_addr) (addStackDepthValue sp' $ constantDepthValue 8)
+fromX86Offset :: Int64 -> ConstStackDepth
+fromX86Offset i | i < 0 = CSD (negate (toInteger i))
+                | otherwise = CSD 0
 
-        ParsedJump proc_state tgt_addr -> do
-          addStateVars init_sp proc_state
+csdMax :: ConstStackDepth -> ConstStackDepth -> ConstStackDepth
+csdMax (CSD x) (CSD y) = CSD (max x y)
 
-          let lbl'     = mkRootBlockLabel tgt_addr
-              sp' = parseStackPointer' init_sp (proc_state ^. boundValue sp_reg)
+$(pure [])
 
-          addBlock lbl' sp'
+type StackWarning w = (SegmentedAddr w, String)
 
-        ParsedReturn _proc_state -> do
-          pure ()
+data ConstStackState w =
+  ConstStackState { _stackDepthWarnings :: ![StackWarning w]
+                  , _maxStackDepth :: !ConstStackDepth
+                  }
 
-        ParsedSyscall proc_state next_addr -> do
-          addStateVars init_sp proc_state
+stackDepthWarnings :: Simple Lens (ConstStackState w) [StackWarning w]
+stackDepthWarnings = lens _stackDepthWarnings (\s v -> s { _stackDepthWarnings = v })
 
-          let sp'  = parseStackPointer' init_sp (proc_state ^. boundValue sp_reg)
-          addBlock (mkRootBlockLabel next_addr) sp'
+maxStackDepth :: Simple Lens (ConstStackState w) ConstStackDepth
+maxStackDepth = lens _maxStackDepth (\s v -> s { _maxStackDepth = v })
 
-        ParsedLookupTable proc_state _idx vec -> do
-          addStateVars init_sp proc_state
+$(pure [])
 
-          let sp'  = parseStackPointer' init_sp (proc_state ^. boundValue sp_reg)
+type ConstStackM w = State (ConstStackState w)
 
-          traverse_ (flip addBlock sp' . mkRootBlockLabel) vec
+addWarning :: SegmentedAddr w -> String -> ConstStackM w ()
+addWarning addr msg =
+  stackDepthWarnings %= ((addr,msg):)
+
+-- | Update the stack depth based on the address of a write.
+maxAddr :: ( OrdF (ArchReg arch)
+           , ShowF (ArchReg arch)
+           , MemWidth (ArchAddrWidth arch)
+           )
+        => AbsProcessorState (ArchReg arch) ids
+           -- ^ Abstract state at end of block
+        -> Int64
+           -- ^ Adjustment to apply to stack pointer in computing height.
+        -> ArchAddrValue arch ids
+           -- ^ Address to consider
+        -> ConstStackM (ArchAddrWidth arch) ()
+maxAddr ps adj addr =
+  case transferValue ps addr of
+    StackOffset _base off
+      | Just (v,_) <- Set.minView off -> do
+        maxStackDepth %= csdMax (fromX86Offset (adj + v))
+    _ -> pure ()
+
+-- | Update the stack depth based on the stack pointer value at the end of a block.
+maxStackPointer :: ( OrdF (ArchReg arch)
+                   , ShowF (ArchReg arch)
+                   , MemWidth (ArchAddrWidth arch)
+                   )
+                => ArchSegmentedAddr arch
+                   -- ^ Address of this blcok
+                -> AbsProcessorState (ArchReg arch) ids
+                   -- ^ Abstract state at end of block
+                -> Int64
+                   -- ^ Adjustment to apply to stack pointer in computing height.
+                -> ArchAddrValue arch ids
+                   -- ^ Address to consider
+                -> ConstStackM (ArchAddrWidth arch) ()
+maxStackPointer block_addr ps adj addr =
+  case transferValue ps addr of
+    StackOffset _base off | Just (v,_) <- Set.minView off -> do
+      maxStackDepth %= csdMax (fromX86Offset (adj + v))
+    _ -> do
+      addWarning block_addr "Could not compute final stack pointer in block."
+
+
+maxStmt :: ( OrdF (ArchReg arch)
+           , ShowF (ArchReg arch)
+           , MemWidth (ArchAddrWidth arch)
+           )
+        => AbsProcessorState (ArchReg arch) ids
+        -> Stmt arch ids
+        -> ConstStackM (ArchAddrWidth arch) ()
+maxStmt ps stmt =
+  case stmt of
+    WriteMem addr _val ->
+      maxAddr ps 0 addr
+    _ -> pure ()
+
+-- | Interpret blcok to look for
+maxBlock :: ( OrdF (ArchReg arch)
+            , ShowF (ArchReg arch)
+            , MemWidth (ArchAddrWidth arch)
+            , RegisterInfo (ArchReg arch)
+            )
+         => ArchSegmentedAddr arch
+            -- ^ Address of this block
+         -> ParsedBlock arch ids
+         -> ConstStackM (ArchAddrWidth arch) ()
+maxBlock block_addr b = do
+  let absState = pblockState b
+  traverse_ (maxStmt absState) (pblockStmts b)
+  case pblockTerm b of
+    ParsedCall s _ -> do
+      -- Add 8 to reflect stack pointer contains return address
+      maxStackPointer block_addr absState 8 (s^.boundValue sp_reg)
+    ParsedJump s _ -> do
+      maxStackPointer block_addr absState 0 (s^.boundValue sp_reg)
+    ParsedLookupTable s _ _ -> do
+      maxStackPointer block_addr absState 0 (s^.boundValue sp_reg)
+    ParsedReturn{} -> do
+      pure ()
+    ParsedBranch{} -> do
+      pure ()
+    ParsedSyscall s _ -> do
+      maxStackPointer block_addr absState 0 (s^.boundValue sp_reg)
+    ParsedTranslateError{} -> do
+      pure ()
+    ClassifyFailure{} -> do
+      pure ()
+
+maxRegion :: ( OrdF (ArchReg arch)
+             , ShowF (ArchReg arch)
+             , MemWidth (ArchAddrWidth arch)
+             , RegisterInfo (ArchReg arch)
+             )
+          => ParsedBlockRegion arch ids
+          -> ConstStackM (ArchAddrWidth arch) ()
+maxRegion r = traverse_ (maxBlock (regionAddr r)) (regionBlockMap r)
+
+-- | Returns the maximum stack argument used by the function, that is,
+-- the highest index above sp0 that is read or written.
+maxConstStackDepth :: ( OrdF (ArchReg arch)
+                      , ShowF (ArchReg arch)
+                      , MemWidth (ArchAddrWidth arch)
+                      , RegisterInfo (ArchReg arch)
+                      )
+                   => DiscoveryFunInfo arch ids
+                   -> (ConstStackDepth, [StackWarning (ArchAddrWidth arch)])
+maxConstStackDepth finfo =
+    case runState (traverse_ maxRegion (finfo^.parsedBlocks)) s0 of
+      ((), s) -> (s^.maxStackDepth, reverse (s^.stackDepthWarnings))
+  where
+    s0   = ConstStackState  { _stackDepthWarnings = []
+                            , _maxStackDepth = CSD 0
+                            }

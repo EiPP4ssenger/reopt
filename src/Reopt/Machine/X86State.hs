@@ -40,9 +40,6 @@ module Reopt.Machine.X86State
   , X86PrimLoc(..)
   , X86Stmt(..)
     -- * X86-64 Specific functions
-  , refsInAssignRhs
-  , refsInValue
-  , refsInApp
   , hasCallComment
   , hasRetComment
   , asStackAddrOffset
@@ -50,6 +47,8 @@ module Reopt.Machine.X86State
     -- * Lists of X86 Registers
   , gpRegList
   , x87FPURegList
+  , valuesInX86PrimFn
+  , valuesInX86Stmt
   , refsInX86PrimFn
   , x86StateRegs
   , x86CalleeSavedRegs
@@ -63,6 +62,7 @@ module Reopt.Machine.X86State
 
 import           Control.Lens
 import           Control.Monad.State.Strict
+import           Data.Foldable
 import           Data.Map.Strict (Map)
 import           Data.Parameterized.Classes
 import           Data.Parameterized.Some
@@ -260,7 +260,7 @@ ppX86PrimFn pp f =
 
 -- | An X86 specific statement.
 --
--- Each of these functions
+-- Each of these operations are expected to have some form of side effect.
 data X86Stmt ids
    = forall tp .
      WriteLoc !(X86PrimLoc tp) !(Value X86_64 ids tp)
@@ -597,42 +597,31 @@ initX86State loc = mkRegState Initial
 ------------------------------------------------------------------------
 -- Compute set of assignIds in values.
 
-refsInX86PrimFn :: X86PrimFn ids tp -> Set (Some (AssignId ids))
-refsInX86PrimFn f =
+valuesInX86PrimFn :: X86PrimFn ids tp -> [Some (Value X86_64 ids)]
+valuesInX86PrimFn f =
   case f of
-    ReadLoc _  -> Set.empty
-    ReadFSBase -> Set.empty
-    ReadGSBase -> Set.empty
-    CPUID v    -> refsInValue v
-    RDTSC      -> Set.empty
-    XGetBV v   -> refsInValue v
-    PShufb _ x y -> Set.union (refsInValue x) (refsInValue y)
-    MemCmp _ cnt src dest dir ->
-      Set.unions [ refsInValue cnt
-                 , refsInValue src
-                 , refsInValue dest
-                 , refsInValue dir
-                 ]
-    RepnzScas _ val buf cnt ->
-      Set.unions [ refsInValue val
-                 , refsInValue buf
-                 , refsInValue cnt
-                 ]
+    ReadLoc _  -> []
+    ReadFSBase -> []
+    ReadGSBase -> []
+    CPUID v    -> [Some v]
+    RDTSC      -> []
+    XGetBV v   -> [Some v]
+    PShufb _ x y -> [Some x, Some y]
+    MemCmp _ cnt src dest dir -> [Some cnt, Some src, Some dest, Some dir]
+    RepnzScas _ val buf cnt -> [Some val, Some buf, Some cnt]
+
+refsInX86PrimFn :: X86PrimFn ids tp -> Set (Some (AssignId ids))
+refsInX86PrimFn f = foldl' (\s (Some v) -> Set.union s (refsInValue v)) Set.empty (valuesInX86PrimFn f)
+
+valuesInX86Stmt :: X86Stmt ids -> [Some (Value X86_64 ids)]
+valuesInX86Stmt (WriteLoc _ rhs) = [Some rhs]
+valuesInX86Stmt (MemCopy _ cnt src dest df) =
+  [ Some cnt, Some src, Some dest, Some df ]
+valuesInX86Stmt (MemSet cnt val dest df) =
+  [ Some cnt, Some val, Some dest, Some df ]
 
 refsInX86Stmt :: X86Stmt ids -> Set (Some (AssignId ids))
-refsInX86Stmt (WriteLoc _ rhs) = refsInValue rhs
-refsInX86Stmt (MemCopy _ cnt src dest df) =
-  Set.unions [ refsInValue cnt
-             , refsInValue src
-             , refsInValue dest
-             , refsInValue df
-             ]
-refsInX86Stmt (MemSet cnt val dest df) =
-  Set.unions [ refsInValue cnt
-             , refsInValue val
-             , refsInValue dest
-             , refsInValue df
-             ]
+refsInX86Stmt stmt = foldl' (\s (Some v) -> Set.union s (refsInValue v)) Set.empty (valuesInX86Stmt stmt)
 
 instance StmtHasRefs X86Stmt where
   refsInStmt = refsInX86Stmt
