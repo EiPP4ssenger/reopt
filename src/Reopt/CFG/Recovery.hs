@@ -733,17 +733,16 @@ recoverFunction :: forall ids
                 -> DiscoveryFunInfo X86_64 ids
                 -> Either String Function
 recoverFunction sysp ftypes mem fInfo = do
-  let a = discoveredFunAddr fInfo
+  let fun_addr = discoveredFunAddr fInfo
   let blockPreds = funBlockPreds fInfo
   -- Make dependency context
   let dctx = dependencyContext sysp mem ftypes fInfo
   -- Get post dependencies
   let postDepMap = postDependencyMap dctx blockPreds
-  trace ("Predecessors for " ++ show a ++ "\n" ++ show (ppFunPredMap blockPreds)) $ do
 
   let cft = fromMaybe
-              (debug DFunRecover ("Missing type for function " ++ show a) ftMaximumFunctionType) $
-              Map.lookup a ftypes
+              (debug DFunRecover ("Missing type for function " ++ show fun_addr) ftMaximumFunctionType) $
+              Map.lookup fun_addr ftypes
 
 --  let insReg i (Some r) = MapF.insert r (FnRegArg r i)
   {-
@@ -761,11 +760,11 @@ recoverFunction sysp ftypes mem fInfo = do
 -}
 
   let rs = RS { rsMemory        = mem
-              , rsInterp = fInfo
+              , rsInterp        = fInfo
               , _rsNextAssignId = FnAssignId 0
-              , _rsCurLabel  = GeneratedBlock a 0
-              , _rsCurStmts  = Seq.empty
-              , _rsAssignMap = MapF.empty
+              , _rsCurLabel     = GeneratedBlock fun_addr 0
+              , _rsCurStmts     = Seq.empty
+              , _rsAssignMap    = MapF.empty
               , rsSyscallPersonality = sysp
               , rsCurrentFunctionType = cft
               , rsFunctionArgs        = ftypes
@@ -787,14 +786,19 @@ recoverFunction sysp ftypes mem fInfo = do
         allocateStackFrame a initRegs depths
       Left msg -> throwError $ "maximumStackDepth: " ++ msg
 -}
+    -- Get parsed region with entry region up front.
+    let parsed_regions = first_region : rest_regions
+          where Just first_region = Map.lookup fun_addr (fInfo^.parsedBlocks)
+                rest_regions      = Map.elems $ Map.delete fun_addr (fInfo^.parsedBlocks)
+
     blks <-
       -- Iterate through regions
-      forM (Map.elems (fInfo^.parsedBlocks)) $ \region -> do
+      forM parsed_regions $ \region -> do
         -- Iterate through individual regions in blocks
         forM (Map.elems (regionBlockMap region)) $ \b -> do
           recoverBlock postDepMap phiBindingMap (regionAddr region) b
 
-    pure Function { fnAddr = a
+    pure Function { fnAddr = fun_addr
                   , fnType = cft
                   , fnBlocks = concat blks
                   , fnBlockPredMap = blockPreds
